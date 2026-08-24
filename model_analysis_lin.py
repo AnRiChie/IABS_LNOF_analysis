@@ -4,7 +4,7 @@ import joblib
 import time
 import random
 from scipy import stats
-from scipy.stats import kendalltau, sem, wilcoxon
+from scipy.stats import kendalltau, sem, wilcoxon, spearmanr
 import pandas as pd
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.linear_model import MultiTaskLasso
@@ -552,249 +552,130 @@ def plot_ablation_r2(model_paths, output_dir='plots'):
     print(f"✓ График Ablation Study успешно сохранен: {save_path}")
 
 
-def plot_cumulative_ablation(model_filenames, models_dir='models_LNOF_Lasso', data_dir='LNOF_SynchronizedData',
-                             output_dir='plots'):
+def calculate_global_addition_thresholds(
+        data_dir='LNOF_SynchronizedData',
+        models_dir='models_LNOF_Lasso',
+        r2_threshold_diff=0.03,
+        med_threshold_diff=0.32,
+        step_size=1,
+        exclude_mice=['J20', 'J21']):
     """
-    Строит график зависимости R2 от последовательного исключения нейронов.
-    Красная кривая - удаление от самых значимых к слабым (Top-Down).
-    Синяя кривая - удаление от самых слабых к значимым (Bottom-Up).
+    Прогоняет кумулятивное добавление "Сверху" по всем валидным сессиям.
+    Рассчитывает средний процент (с CI) от участвующих и от всех нейронов,
+    необходимый для достижения порога R2 и MED.
     """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    c_param = 0.5
+    test_size = 0.25
+    max_iter = 100
 
-    # Подготавливаем пути по твоей логике
-    model_paths = [str(Path(models_dir) / m) for m in model_filenames]
+    r2_part_pcts, r2_tot_pcts = [], []
+    med_part_pcts, med_tot_pcts = [], []
 
-    for m_path in model_paths:
-        base_data = joblib.load(m_path)
-        model_name = Path(m_path).stem  # Например, 'J30_1D'
+    models_path = Path(models_dir)
+    all_models = list(models_path.glob("*.pkl"))
 
-        print(f"\n{'=' * 50}")
-        print(f"[{model_name}] Загрузка исходных данных...")
+    print(f"\n{'=' * 80}")
+    print(f"ГЛОБАЛЬНЫЙ РАСЧЕТ ПОРОГОВ (Моделей найдено: {len(all_models)})")
+    print(f"Цель: ΔR2 <= {r2_threshold_diff}, ΔMED <= {med_threshold_diff}")
+    print(f"Ожидайте, это займет время...")
+    print(f"{'=' * 80}")
 
-        filepath = Path(data_dir) / f"LNOF_{model_name}_aligned.npz"
-        X_full, y_full = load_data(filepath)  # Используем твой load_data
-
-        if X_full is None or y_full is None:
-            print(f"[SKIP] Нет данных для {model_name}")
+    for file in all_models:
+        session_name = file.stem
+        if session_name[:3] in exclude_mice:
             continue
 
-        # Временной сплит 75/25
-        split_idx = int(len(X_full) * 0.75)
-        X_test = X_full.iloc[split_idx:]
-        y_test = y_full.iloc[split_idx:]
-
-        # --- 1. Считаем бейзлайн (точка 0) ---
-        X_imp = base_data['imputer'].transform(X_test)
-        X_sc = base_data['scaler'].transform(X_imp)
-        y_pred = base_data['model'].predict(X_sc)
-        base_r2 = r2_score(y_test, y_pred, multioutput='uniform_average')
-
-        # --- 2. Ранжируем значимые нейроны ---
-        importance = np.linalg.norm(base_data['model'].coef_, axis=0)
-        active_indices = np.where(importance > 0)[0]
-
-        # Собираем кортежи (ID нейрона, важность)
-        active_neurons = []
-        for idx in active_indices:
-            match = re.search(r'\d+', base_data['feature_names'][idx])
-            if match:
-                active_neurons.append((int(match.group()), importance[idx]))
-
-        if not active_neurons:
-            print(f"[SKIP] Нет активных нейронов в {model_name}")
+        data_file = Path(data_dir) / f"LNOF_{session_name}_aligned.npz"
+        if not data_file.exists():
             continue
 
-        # Сортируем
-        top_down = sorted(active_neurons, key=lambda x: x[1], reverse=True)  # Самые сильные сверху
-        bottom_up = sorted(active_neurons, key=lambda x: x[1], reverse=False)  # Самые слабые сверху
+        # Загрузка
+        m_data = joblib.load(file)
+        model = m_data.get('model')
+        if not hasattr(model, 'coef_'):
+            continue
 
-        top_down_ids = [n[0] for n in top_down]
-        bottom_up_ids = [n[0] for n in bottom_up]
+        base_coef = model.coef_
+        all_features = np.array(m_data.get('feature_names'))
+        all_feat_list = list(all_features)
+        num_tot = len(all_features)
 
-        # --- 3. Кумулятивное удаление: Top-Down (Красная кривая) ---
-        print(f"[{model_name}] Считаем Top-Down (от сильных к слабым)...")
-        r2_top_down = [base_r2]
-        removed_top = []
+        weights = np.linalg.norm(base_coef, axis=0) if base_coef.ndim > 1 else np.abs(base_coef)
+        important_mask = weights > 0
+        num_part = np.sum(important_mask)
 
-        for feat_id in top_down_ids:
-            removed_top.append(feat_id)  # Накапливаем удаляемые нейроны
+        if num_part == 0:
+            continue
 
-            # Обрезаем модель
-            pruned_dict = prune_model_features(m_path, feature_to_remove=removed_top)
+        part_features = all_features[important_mask]
+        part_weights = weights[important_mask]
 
-            # Оставляем в данных только те фичи, которые остались в модели
-            X_test_pruned = X_test[pruned_dict['feature_names']]
+        # Только Сверху (descending)
+        feat_desc = part_features[np.argsort(part_weights)[::-1]]
 
-            # Предсказываем
-            p_imp = pruned_dict['imputer'].transform(X_test_pruned)
-            p_sc = pruned_dict['scaler'].transform(p_imp)
-            p_pred = pruned_dict['model'].predict(p_sc)
+        features_raw, labels = load_data(data_file)
+        X_train_full, X_test_full, y_train, y_test = train_test_split_temporal(features_raw, labels,
+                                                                               test_size=test_size)
 
-            r2_top_down.append(r2_score(y_test, p_pred, multioutput='uniform_average'))
+        def evaluate_subset(features_subset):
+            if len(features_subset) == 0:
+                return 0.0, np.nan
+            if isinstance(X_train_full, pd.DataFrame):
+                X_tr, X_te = X_train_full[features_subset], X_test_full[features_subset]
+            else:
+                idx = [all_feat_list.index(f) for f in features_subset]
+                X_tr, X_te = X_train_full[:, idx], X_test_full[:, idx]
 
-        # --- 4. Кумулятивное удаление: Bottom-Up (Синяя кривая) ---
-        print(f"[{model_name}] Считаем Bottom-Up (от слабых к сильным)...")
-        r2_bottom_up = [base_r2]
-        removed_bottom = []
+            clf, imp, scl, metrics = train_lasso(X_tr, y_train, X_te, y_test, C=c_param, max_iter=max_iter)
+            return metrics.get('test_r2', 0.0), metrics.get('test_dist', metrics.get('test_med', np.nan))
 
-        for feat_id in bottom_up_ids:
-            removed_bottom.append(feat_id)  # Накапливаем удаляемые нейроны
+        base_r2, base_med = evaluate_subset(all_features)
 
-            pruned_dict = prune_model_features(m_path, feature_to_remove=removed_bottom)
+        steps = list(range(0, num_part, step_size))
+        if steps[-1] != num_part: steps.append(num_part)
 
-            X_test_pruned = X_test[pruned_dict['feature_names']]
+        r2_vals, med_vals = [], []
+        for k in steps:
+            r, m = evaluate_subset(feat_desc[:k])
+            r2_vals.append(r)
+            med_vals.append(m)
 
-            p_imp = pruned_dict['imputer'].transform(X_test_pruned)
-            p_sc = pruned_dict['scaler'].transform(p_imp)
-            p_pred = pruned_dict['model'].predict(p_sc)
+        # R2 Threshold
+        idx_r2 = next((i for i, v in enumerate(r2_vals) if v >= base_r2 - r2_threshold_diff), None)
+        if idx_r2 is not None:
+            k_r2 = steps[idx_r2]
+            r2_part_pcts.append(k_r2 / num_part * 100)
+            r2_tot_pcts.append(k_r2 / num_tot * 100)
 
-            r2_bottom_up.append(r2_score(y_test, p_pred, multioutput='uniform_average'))
+        # MED Threshold
+        idx_med = next((i for i, v in enumerate(med_vals) if not np.isnan(v) and v <= base_med + med_threshold_diff),
+                       None)
+        if idx_med is not None:
+            k_med = steps[idx_med]
+            med_part_pcts.append(k_med / num_part * 100)
+            med_tot_pcts.append(k_med / num_tot * 100)
 
-        # --- 5. Отрисовка графиков ---
-        plt.figure(figsize=(10, 6))
+    def calc_stats(arr):
+        if not arr: return 0.0, 0.0
+        return np.mean(arr), 1.96 * sem(arr)
 
-        # Ось X: от 0 (ничего не удалено) до N (удалены все значимые)
-        x_vals = range(len(top_down_ids) + 1)
+    m_r2_p, ci_r2_p = calc_stats(r2_part_pcts)
+    m_r2_t, ci_r2_t = calc_stats(r2_tot_pcts)
+    m_med_p, ci_med_p = calc_stats(med_part_pcts)
+    m_med_t, ci_med_t = calc_stats(med_tot_pcts)
 
-        plt.plot(x_vals, r2_top_down, color='red', marker='o', markersize=4, linewidth=2,
-                 label='Top-Down (сначала удаляем сильные)')
-        plt.plot(x_vals, r2_bottom_up, color='blue', marker='o', markersize=4, linewidth=2,
-                 label='Bottom-Up (сначала удаляем слабые)')
+    print(f"\n[ГОТОВО! ГЛОБАЛЬНАЯ СТАТИСТИКА ({len(r2_part_pcts)} валидных сессий)]")
+    print(f"Для R2 (Δ <= {r2_threshold_diff}):")
+    print(f"  > От УЧАСТВУЮЩИХ нейронов: {m_r2_p:.1f}% ± {ci_r2_p:.1f}%")
+    print(f"  > От ВСЕХ нейронов:        {m_r2_t:.1f}% ± {ci_r2_t:.1f}%")
 
-        plt.title(f'Cumulative Ablation: Падение R2 при удалении нейронов\nМодель: {model_name}', fontsize=14)
-        plt.xlabel('Количество исключенных нейронов', fontsize=12)
-        plt.ylabel(r'$R^2$ Score (качество декодирования)', fontsize=12)
-
-        # Защита от сильных провалов в минус, чтобы график оставался читаемым
-        min_y = min(min(r2_top_down), min(r2_bottom_up))
-        if min_y < -1.0:
-            plt.ylim(bottom=-1.0)  # Ограничиваем хвост снизу
-
-        plt.axhline(0, color='black', linewidth=1, linestyle='--')  # Линия нулевого R2
-        plt.grid(True, linestyle='--', alpha=0.6)
-        plt.legend(loc='best')
-
-        save_path = output_path / f'cumulative_ablation_{model_name}.png'
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=300)
-        plt.close()
-
-        print(f"✓ График сохранен: {save_path}")
+    print(f"\nДля MED (Δ <= {med_threshold_diff}):")
+    print(f"  > От УЧАСТВУЮЩИХ нейронов: {m_med_p:.1f}% ± {ci_med_p:.1f}%")
+    print(f"  > От ВСЕХ нейронов:        {m_med_t:.1f}% ± {ci_med_t:.1f}%")
+    print(f"{'=' * 80}\n")
 
 
 from linreg_behavior import train_test_split_temporal, train_lasso
-
-
-def plot_seed_robustness(npz_filenames, data_dir='LNOF_SynchronizedData', output_dir='plots',
-                         seeds=[42, 123, 999, 2026, 7777],
-                         c_param=1.0, max_iter=1000, test_size=0.25):
-    """
-    Обучает модели на указанных файлах с разными random_state (сидами)
-    и строит график дисперсии R2.
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    results = []
-
-    for filename in npz_filenames:
-        # Извлекаем красивое имя модели (например, 'J30_1D' из 'LNOF_J30_1D_aligned.npz')
-        model_name = filename.replace('LNOF_', '').replace('_aligned.npz', '')
-        file_path = Path(data_dir) / filename
-
-        if not file_path.exists():
-            print(f"[SKIP] Файл не найден: {file_path}")
-            continue
-
-        print(f"\n[{model_name}] Загрузка данных...")
-
-        # Загружаем данные (твоя функция)
-        features, labels = load_data(file_path)
-        if features is None or labels is None:
-            continue
-
-        # Хронологический сплит (одинаковый для всех сидов)
-        X_train, X_test, y_train, y_test = train_test_split_temporal(
-            features, labels, test_size=test_size
-        )
-
-        print(f"[{model_name}] Обучение на {len(seeds)} разных seeds...")
-        for seed in seeds:
-            # Обучаем модель (убедись, что твой train_lasso передает random_state=seed внутрь MultiTaskLasso)
-            clf, imp, scl, metrics = train_lasso(
-                X_train, y_train, X_test, y_test,
-                C=c_param, max_iter=max_iter, random_state=seed
-            )
-
-            # Предполагаем, что test_r2 лежит в словаре metrics (как мы делали ранее)
-            # Если твой train_lasso возвращает сразу R2, замени эту строчку
-            r2 = metrics.get('test_r2', np.nan)
-
-            results.append({
-                'model': model_name,
-                'seed': seed,
-                'r2': r2
-            })
-
-    if not results:
-        print("[WARNING] Нет данных для построения графика.")
-        return
-
-    # --- Подготовка данных для графика ---
-    df_results = pd.DataFrame(results)
-
-    # Считаем среднее значение R2 для каждой модели
-    df_mean = df_results.groupby('model')['r2'].mean().reset_index()
-
-    # --- Отрисовка ---
-    # Ширина графика динамически зависит от количества моделей
-    plt.figure(figsize=(max(10, len(npz_filenames) * 1.5), 7))
-
-    # Рисуем все попытки с разными сидами (черные точки)
-    sns.stripplot(
-        data=df_results,
-        x='model',
-        y='r2',
-        color='black',
-        alpha=0.6,
-        jitter=True,
-        size=5,
-        label='Individual Seed'
-    )
-
-    # Рисуем среднее значение (маленькая красная точка БЕЗ обводки)
-    # edgecolor='none' убирает черное кольцо, s=40 делает точку компактной
-    sns.scatterplot(
-        data=df_mean,
-        x='model',
-        y='r2',
-        color='red',
-        s=40,
-        edgecolor='none',
-        zorder=10,
-        label='Mean $R^2$'
-    )
-
-    plt.title('Robustness Check: Дисперсия $R^2$ при разных Random Seeds', fontsize=15)
-    plt.xlabel('Модель (Сессия)', fontsize=12)
-    plt.ylabel(r'Коэффициент детерминации ($R^2$)', fontsize=12)
-
-    # Сетка и угол наклона подписей
-    plt.grid(axis='y', linestyle='--', alpha=0.6)
-    plt.xticks(rotation=45, ha='right')
-
-    # Убираем дубликаты из легенды
-    handles, labels = plt.gca().get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    plt.legend(by_label.values(), by_label.keys(), loc='best')
-
-    plt.tight_layout()
-    save_path = output_path / 'seed_robustness_variance.png'
-    plt.savefig(save_path, dpi=300)
-    plt.close()
-
-    print(f"✓ График проверки сидов успешно сохранен: {save_path}")
 
 
 def calculate_cross_session_overlap(mice_list, threshold, models_dir='models_LNOF_Lasso',
@@ -1489,10 +1370,253 @@ def calculate_session_jaccard_stats(
     print(f"{'=' * 85}\n")
 
 
+def analyze_top_vs_rest_comparability(
+        metrics_csv='stat_tables/top_vs_rest_metrics_abl.csv',
+        r2_threshold=0.15,
+        exclude_mice=['J20', 'J21']):
+    """
+    Анализирует совпадение качества моделей (R2) обученных только на сильных
+    нейронах и только на остальных важных.
+    Рассчитывает пороги по количеству нейронов и доли сессий.
+    Включает расчет квантильного порога для топ-сессий.
+    """
+    path_csv = Path(metrics_csv)
+    if not path_csv.exists():
+        print(f"[ERROR] Файл не найден: {path_csv}")
+        return
+
+    df = pd.read_csv(path_csv)
+
+    # --- 0. Исключение дефектных мышей ---
+    if exclude_mice:
+        if 'mouse' in df.columns:
+            df = df[~df['mouse'].isin(exclude_mice)]
+        elif 'model_name' in df.columns:
+            df = df[~df['model_name'].str.startswith(tuple(exclude_mice))]
+        elif 'model_session' in df.columns:
+            df = df[~df['model_session'].str.startswith(tuple(exclude_mice))]
+
+    # Очистка от NaN для нужных колонок
+    req_cols = ['top_count', 'top_r2', 'rest_r2']
+    if not all(c in df.columns for c in req_cols):
+        print(f"[ERROR] В таблице отсутствуют нужные колонки: {req_cols}")
+        return
+
+    df_clean = df.dropna(subset=req_cols).copy()
+    total_sessions = len(df_clean)
+
+    if total_sessions == 0:
+        print("[ERROR] Нет данных после очистки NaN/исключения мышей.")
+        return
+
+    # Расчет абсолютной разницы R2 между двумя моделями
+    df_clean['r2_diff'] = (df_clean['top_r2'] - df_clean['rest_r2']).abs()
+
+    # --- 1. Общий процент совпадения ---
+    comparable_mask = df_clean['r2_diff'] <= r2_threshold
+    comparable_sessions = df_clean[comparable_mask]
+    num_comparable = len(comparable_sessions)
+    overall_comparable_pct = (num_comparable / total_sessions) * 100
+
+    if num_comparable == 0:
+        print(f"\n[INFO] Нет сессий с разницей R2 <= {r2_threshold}")
+        return
+
+    # --- 2. Порог по количеству сильных нейронов (абсолютный минимум для совпадения) ---
+    min_top_count = comparable_sessions['top_count'].min()
+
+    # Разделение выборки на "под порогом" и "над порогом"
+    below_mask = df_clean['top_count'] < min_top_count
+    above_mask = df_clean['top_count'] >= min_top_count
+
+    # --- 3. Сессии ПОД порогом ---
+    sessions_below = len(df_clean[below_mask])
+    pct_below = (sessions_below / total_sessions) * 100
+
+    # --- 4. Сессии НАД порогом ---
+    sessions_above = len(df_clean[above_mask])
+    pct_above = (sessions_above / total_sessions) * 100
+
+    # --- 5. Процент сравнимых сессий СРЕДИ тех, что НАД порогом ---
+    comparable_above = len(df_clean[above_mask & comparable_mask])
+    if sessions_above > 0:
+        pct_comparable_above = (comparable_above / sessions_above) * 100
+    else:
+        pct_comparable_above = 0.0
+
+    # --- 6. Квантильный порог (Топ-P% сессий по числу сильных нейронов) ---
+    # Сортируем по убыванию сильных нейронов и берем столько же сессий, сколько всего сопоставимых (num_comparable)
+    top_k_sessions = df_clean.sort_values(by='top_count', ascending=False).head(num_comparable)
+    quantile_threshold = top_k_sessions['top_count'].min()
+
+    # Находим все сессии, которые физически прошли этот порог
+    quantile_mask = df_clean['top_count'] >= quantile_threshold
+
+    # Пересечение: сессии, которые И сопоставимы, И находятся в топ-P% по числу нейронов
+    comparable_and_in_quantile = df_clean[quantile_mask & comparable_mask]
+    pct_comp_and_quant_of_total = (len(comparable_and_in_quantile) / total_sessions) * 100
+
+    # =========================================================================
+    # ВЫВОД В КОНСОЛЬ
+    # =========================================================================
+    print(f"\n{'=' * 85}")
+    print(f"АНАЛИЗ СОВПАДЕНИЯ МОДЕЛЕЙ: Сильные (>3σ) vs Остальные важные")
+    print(f"Порог сходства по R2: Δ <= {r2_threshold}")
+    print(f"{'=' * 85}\n")
+
+    print(f"Всего проанализировано валидных сессий: {total_sessions} шт.\n")
+
+    print(f"1. Общий процент сессий со сравнимым R2 (разница <= {r2_threshold}):")
+    print(f"   > {overall_comparable_pct:.1f}% ({num_comparable} из {total_sessions} сессий)\n")
+
+    print(f"2. Порог работоспособности (минимальное число сильных нейронов для такого сходства):")
+    print(f"   > {min_top_count:.0f} сильных нейронов\n")
+
+    print(f"3. Сессий, не дотянувших до этого порога (менее {min_top_count:.0f} сильных нейронов):")
+    print(f"   > {sessions_below} шт., что составляет {pct_below:.1f}% от всех сессий\n")
+
+    print(f"4. Сессий выше или равных порогу (от {min_top_count:.0f} сильных нейронов):")
+    print(f"   > {sessions_above} шт., что составляет {pct_above:.1f}% от всех сессий\n")
+
+    print(f"5. Надежность предсказания при наличии минимального числа сильных нейронов:")
+    print(f"   (Процент сессий со сравнимым R2 ТОЛЬКО среди тех, что преодолели порог в {min_top_count:.0f} нейронов)")
+    print(f"   > {pct_comparable_above:.1f}% ({comparable_above} из {sessions_above} сессий)\n")
+
+    print(f"6. Квантильный порог (Топ-{overall_comparable_pct:.1f}% сессий с наибольшим числом сильных нейронов):")
+    print(f"   > Порог для попадания в этот топ: {quantile_threshold:.0f} сильных нейронов")
+    print(
+        f"   > Доля сессий, которые И в этом Топ-{overall_comparable_pct:.1f}%, И сопоставимы по R2 (от ВСЕХ сессий):")
+    print(f"   > {pct_comp_and_quant_of_total:.1f}% ({len(comparable_and_in_quantile)} из {total_sessions} сессий)\n")
+
+    print(f"{'=' * 85}")
+
+
+def satisfy_nikitos_correlation_check(
+        models_dir='models_LNOF_Lasso',
+        exclude_mice=['J20', 'J21']):
+    """
+    Рассчитывает метрики для ответа на комментарий [N1] "Цифры есть?".
+    Анализирует:
+    1. Корреляцию между числом активных нейронов и средним модулем их весов.
+    2. Зависимость этих параметров от дня эксперимента (1D - 4D).
+    """
+    models_path = Path(models_dir)
+    if not models_path.exists():
+        print(f"[ERROR] Папка {models_dir} не найдена.")
+        return
+
+    results = []
+
+    print(f"\n{'=' * 80}")
+    print("РАСЧЕТ КОРРЕЛЯЦИЙ: Количество активных нейронов vs Средний вес vs День")
+    print(f"{'=' * 80}")
+
+    for file in models_path.glob("*.pkl"):
+        stem = file.stem
+        parts = stem.split('_')
+
+        if len(parts) < 2:
+            continue
+
+        mouse = parts[0]
+        day_str = parts[1]
+
+        if mouse in exclude_mice:
+            continue
+
+        # Вытаскиваем номер дня (например, из '1D' -> 1)
+        try:
+            day_num = int(''.join(filter(str.isdigit, day_str)))
+        except ValueError:
+            continue
+
+        # Загрузка модели
+        data = joblib.load(file)
+        model = data.get('model')
+        if not hasattr(model, 'coef_'):
+            continue
+
+        # Получаем модули весов
+        coefs = np.array(model.coef_)
+        weights = np.linalg.norm(coefs, axis=0) if coefs.ndim > 1 else np.abs(coefs)
+
+        # Выделяем только активные (важные) нейроны
+        active_weights = weights[weights > 0]
+        n_active = len(active_weights)
+
+        if n_active > 0:
+            mean_weight = np.mean(active_weights)
+            results.append({
+                'mouse': mouse,
+                'day': day_num,
+                'n_active': n_active,
+                'mean_weight': mean_weight
+            })
+
+    df = pd.DataFrame(results)
+
+    if df.empty:
+        print("[ERROR] Не удалось собрать данные из моделей.")
+        return
+
+    # --- Статистические тесты (Спирмен) ---
+    def calc_spearman(x, y):
+        corr, p = spearmanr(x, y)
+        stars = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else "ns"
+        return corr, p, stars
+
+    # 1. Количество активных vs Средний вес
+    r_nw, p_nw, s_nw = calc_spearman(df['n_active'], df['mean_weight'])
+
+    # 2. День vs Количество активных
+    r_dn, p_dn, s_dn = calc_spearman(df['day'], df['n_active'])
+
+    # 3. День vs Средний вес
+    r_dw, p_dw, s_dw = calc_spearman(df['day'], df['mean_weight'])
+
+    # --- Сводка по дням (для красоты и наглядности) ---
+    agg_df = df.groupby('day').agg(
+        mean_n=('n_active', np.mean),
+        ci_n=('n_active', lambda x: 1.96 * sem(x)),
+        mean_w=('mean_weight', np.mean),
+        ci_w=('mean_weight', lambda x: 1.96 * sem(x))
+    )
+
+    # --- ВЫВОД В КОНСОЛЬ ---
+    print("\n[СВОДКА ПО ДНЯМ (Mean ± 1.96*SE)]")
+    for day, row in agg_df.iterrows():
+        print(f"День {day}: {row['mean_n']:.1f} ± {row['ci_n']:.1f} нейронов | "
+              f"Средний вес: {row['mean_w']:.4f} ± {row['ci_w']:.4f}")
+
+    print("\n[СТАТИСТИКА СПИРМЕНА]")
+    print(f"1. Кол-во нейронов vs Средний вес: ρ = {r_nw:.3f}, p = {p_nw:.3e} ({s_nw})")
+    print(f"2. День эксперимента vs Кол-во:    ρ = {r_dn:.3f}, p = {p_dn:.3e} ({s_dn})")
+    print(f"3. День эксперимента vs Вес:       ρ = {r_dw:.3f}, p = {p_dw:.3e} ({s_dw})")
+
+    print(f"\n{'=' * 80}")
+    print("✓ ГОТОВЫЙ ТЕКСТ ДЛЯ СТАТЬИ:")
+
+    # Формируем авто-ответ
+    if p_nw >= 0.05:
+        text_nw = f"Заметной корреляции между средним модулем весов и количеством активных нейронов не выявлено (ρ = {r_nw:.2f}, p = {p_nw:.2f})."
+    else:
+        text_nw = f"Выявлена значимая корреляция между средним модулем весов и количеством активных нейронов (ρ = {r_nw:.2f}, p = {p_nw:.3f})."
+
+    if p_dw >= 0.05:
+        text_dw = f"Также средний модуль веса оставался стабильным в зависимости от дня эксперимента (ρ = {r_dw:.2f}, p = {p_dw:.2f})."
+    else:
+        text_dw = f"При этом наблюдалась зависимость среднего модуля веса от дня эксперимента (ρ = {r_dw:.2f}, p = {p_dw:.3f})."
+
+    print(f"{text_nw} {text_dw}")
+    print(f"{'=' * 80}")
+
+
 if __name__ == "__main__":
 
     # recalculate_text_metrics_to_95ci()
-    calculate_session_jaccard_stats()
+    # calculate_session_jaccard_stats()
+    # analyze_top_vs_rest_comparability(r2_threshold=0.15)
+    satisfy_nikitos_correlation_check()
 
     # find_negative_ablation_r2()
     # analyze_performance_wilcoxon()
@@ -1635,3 +1759,4 @@ if __name__ == "__main__":
     # print(df_mob)
 
     # plot_chronological_tracking(results_dict)
+    calculate_global_addition_thresholds()

@@ -12,7 +12,7 @@ import matplotlib.colors as mcolors
 import matplotlib.lines as mlines
 from shapely.geometry import Point
 from itertools import product
-from matplotlib.ticker import MaxNLocator, FuncFormatter, NullFormatter
+from matplotlib.ticker import MaxNLocator, FuncFormatter, NullFormatter, MultipleLocator, LogLocator
 from matplotlib.patches import Circle
 from matplotlib.markers import MarkerStyle
 import matplotlib.gridspec as gridspec
@@ -97,6 +97,117 @@ def plot_importance_distribution(mouse_id, session, models_dir='models_LNOF_Lass
 
     except Exception as e:
         print(f"[ERROR] Failed to plot importance for {model_filename}: {e}")
+
+
+def plot_seed_robustness(npz_filenames, data_dir='LNOF_SynchronizedData', output_dir='plots',
+                         seeds=[42, 123, 999, 2026, 7777],
+                         c_param=1.0, max_iter=1000, test_size=0.25):
+    """
+    Обучает модели на указанных файлах с разными random_state (сидами)
+    и строит график дисперсии R2.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    results = []
+
+    for filename in npz_filenames:
+        # Извлекаем красивое имя модели (например, 'J30_1D' из 'LNOF_J30_1D_aligned.npz')
+        model_name = filename.replace('LNOF_', '').replace('_aligned.npz', '')
+        file_path = Path(data_dir) / filename
+
+        if not file_path.exists():
+            print(f"[SKIP] Файл не найден: {file_path}")
+            continue
+
+        print(f"\n[{model_name}] Загрузка данных...")
+
+        # Загружаем данные (твоя функция)
+        features, labels = load_data(file_path)
+        if features is None or labels is None:
+            continue
+
+        # Хронологический сплит (одинаковый для всех сидов)
+        X_train, X_test, y_train, y_test = train_test_split_temporal(
+            features, labels, test_size=test_size
+        )
+
+        print(f"[{model_name}] Обучение на {len(seeds)} разных seeds...")
+        for seed in seeds:
+            # Обучаем модель (убедись, что твой train_lasso передает random_state=seed внутрь MultiTaskLasso)
+            clf, imp, scl, metrics = train_lasso(
+                X_train, y_train, X_test, y_test,
+                C=c_param, max_iter=max_iter, random_state=seed
+            )
+
+            # Предполагаем, что test_r2 лежит в словаре metrics (как мы делали ранее)
+            # Если твой train_lasso возвращает сразу R2, замени эту строчку
+            r2 = metrics.get('test_r2', np.nan)
+
+            results.append({
+                'model': model_name,
+                'seed': seed,
+                'r2': r2
+            })
+
+    if not results:
+        print("[WARNING] Нет данных для построения графика.")
+        return
+
+    # --- Подготовка данных для графика ---
+    df_results = pd.DataFrame(results)
+
+    # Считаем среднее значение R2 для каждой модели
+    df_mean = df_results.groupby('model')['r2'].mean().reset_index()
+
+    # --- Отрисовка ---
+    # Ширина графика динамически зависит от количества моделей
+    plt.figure(figsize=(max(10, len(npz_filenames) * 1.5), 7))
+
+    # Рисуем все попытки с разными сидами (черные точки)
+    sns.stripplot(
+        data=df_results,
+        x='model',
+        y='r2',
+        color='black',
+        alpha=0.6,
+        jitter=True,
+        size=5,
+        label='Individual Seed'
+    )
+
+    # Рисуем среднее значение (маленькая красная точка БЕЗ обводки)
+    # edgecolor='none' убирает черное кольцо, s=40 делает точку компактной
+    sns.scatterplot(
+        data=df_mean,
+        x='model',
+        y='r2',
+        color='red',
+        s=40,
+        edgecolor='none',
+        zorder=10,
+        label='Mean $R^2$'
+    )
+
+    plt.title('Robustness Check: Дисперсия $R^2$ при разных Random Seeds', fontsize=15)
+    plt.xlabel('Модель (Сессия)', fontsize=12)
+    plt.ylabel(r'Коэффициент детерминации ($R^2$)', fontsize=12)
+
+    # Сетка и угол наклона подписей
+    plt.grid(axis='y', linestyle='--', alpha=0.6)
+    plt.xticks(rotation=45, ha='right')
+
+    # Убираем дубликаты из легенды
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), loc='best')
+
+    plt.tight_layout()
+    save_path = output_path / 'seed_robustness_variance.png'
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+    print(f"✓ График проверки сидов успешно сохранен: {save_path}")
 
 
 def plot_metrics_distribution(models_dir='models_LNOF_L2', output_dir='plots', importance_threshold=0.0):
@@ -1400,10 +1511,10 @@ def plot_global_euler_diagram(sessions=None,
     subsets = [global_sets[k] for k in sets_to_plot if k in global_sets]
 
     label_map = {
-        'intense': 'MI',
-        'linreg': 'LR-weights',
-        'zcrit': r'z-$\Delta$',
-        'crit': r'$\Delta$'
+        'intense': 'Клетки места',
+        'linreg': 'Участвующие',
+        'zcrit': 'Важные', #r'z-$\delta$',
+        'crit': r'$\delta$'
     }
     labels = [label_map.get(k, k.upper()) for k in sets_to_plot if k in global_sets]
 
@@ -1862,8 +1973,8 @@ def plot_delta_vs_mi_dependencies(ablation_csv='stat_tables/full_ablation_stats.
             fontsize=14, color=c_text,
             bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', pad=5), zorder=5)
 
-    ax.set_xlabel(r'MI место & $Ca^{2+}$-активность', fontsize=13, labelpad=10, color=c_text)
-    ax.set_ylabel('Падение точности предсказания (z-значения)', fontsize=13, labelpad=10, color=c_text)
+    ax.set_xlabel(r'MI место & $Ca^{2+}$-активность', fontsize=26, labelpad=10, color=c_text)
+    ax.set_ylabel('Падение точности предсказания (z-значения)', fontsize=26, labelpad=10, color=c_text)
 
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -1889,7 +2000,7 @@ def plot_heavy_tailed_distributions(sessions=None,
                                     output_dir='plots'):
     """
     Строит распределения MI и Delta R2 с двойным разрывом осей.
-    Эстетика: Увеличенные шрифты, типографские двойные засечки (double slashes) на разрывах.
+    Эстетика: Увеличенные шрифты, идеальные двойные засечки на разрывах.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -2009,17 +2120,16 @@ def plot_heavy_tailed_distributions(sessions=None,
     ax_mi.plot(x_mi, y_mi, color=c_mi, linewidth=2.5, zorder=3)
     ax_mi.axvline(stats['MI']['mode'], color='grey', linestyle='--', alpha=0.6, linewidth=2, zorder=2)
 
-    # Увеличенный коэффициент (fontsize=16)
+    # Увеличенный коэффициент
     ax_mi.text(0.95, 0.95, f"$\\mu_3 = {stats['MI']['skew']:.2f}$",
                transform=ax_mi.transAxes, ha='right', va='top',
-               fontsize=16, color=c_text, bbox=dict(facecolor='white', alpha=0.9, edgecolor='none'))
+               fontsize=30, color=c_text, bbox=dict(facecolor='white', alpha=0.9, edgecolor='none'))
 
     ax_mi.set_xlim(left=0)
     ax_mi.set_ylim(bottom=0, top=y_mi.max() * 1.15)
 
-    # Увеличенные заголовки и подписи (fontsize=17, 15)
-    ax_mi_common.set_title('Распределение информативности нейронов', fontsize=17, pad=15, fontweight='bold',
-                           color=c_text)
+    # Увеличенные заголовки и подписи
+    ax_mi_common.set_title('Распределение информативности нейронов', fontsize=17, pad=15, fontweight='bold', color=c_text)
     ax_mi_common.set_xlabel(r'MI место & $Ca^{2+}$-активность', fontsize=15, labelpad=25, color=c_text)
 
     ax_mi.spines['top'].set_visible(False)
@@ -2086,38 +2196,26 @@ def plot_heavy_tailed_distributions(sessions=None,
     tilt_c = 0.015  # Наклон для центрального графика
     tilt_s = tilt_c * 8  # Усиленный наклон для узких боковых графиков
 
-    gap_c = 0.008  # Расстояние между двойными линиями в центре
-    gap_s = gap_c * 8  # Расстояние для боковых панелей
-
     # Толщина линий засечек строго равна толщине осей (lw=1.2)
     kw_l = dict(transform=ax_d_left.transAxes, color=c_text, clip_on=False, lw=1.2)
     kw_c = dict(transform=ax_d_center.transAxes, color=c_text, clip_on=False, lw=1.2)
     kw_r = dict(transform=ax_d_right.transAxes, color=c_text, clip_on=False, lw=1.2)
 
-    # Разрыв 1 (Левый) -> Двойные линии
-    ax_d_left.plot((1 - tilt_s - gap_s, 1 + tilt_s - gap_s), (-d, +d), **kw_l)
-    ax_d_left.plot((1 - tilt_s + gap_s, 1 + tilt_s + gap_s), (-d, +d), **kw_l)
+    # Разрыв 1 (Левый) -> 1 линия слева + 1 линия справа = 2 засечки
+    ax_d_left.plot((1 - tilt_s, 1 + tilt_s), (-d, +d), **kw_l)
+    ax_d_center.plot((-tilt_c, +tilt_c), (-d, +d), **kw_c)
 
-    ax_d_center.plot((-tilt_c - gap_c, +tilt_c - gap_c), (-d, +d), **kw_c)
-    ax_d_center.plot((-tilt_c + gap_c, +tilt_c + gap_c), (-d, +d), **kw_c)
-
-    # Разрыв 2 (Правый) -> Двойные линии
-    ax_d_center.plot((1 - tilt_c - gap_c, 1 + tilt_c - gap_c), (-d, +d), **kw_c)
-    ax_d_center.plot((1 - tilt_c + gap_c, 1 + tilt_c + gap_c), (-d, +d), **kw_c)
-
-    ax_d_right.plot((-tilt_s - gap_s, +tilt_s - gap_s), (-d, +d), **kw_r)
-    ax_d_right.plot((-tilt_s + gap_s, +tilt_s + gap_s), (-d, +d), **kw_r)
+    # Разрыв 2 (Правый) -> 1 линия слева + 1 линия справа = 2 засечки
+    ax_d_center.plot((1 - tilt_c, 1 + tilt_c), (-d, +d), **kw_c)
+    ax_d_right.plot((-tilt_s, +tilt_s), (-d, +d), **kw_r)
 
     # --- ИДЕАЛЬНОЕ ВЫРАВНИВАНИЕ ПОДПИСЕЙ ---
-    # Увеличенные заголовки и подписи (fontsize=17, 15)
-    ax_d_common.set_title('Распределение влияния удаления нейронов', fontsize=17, pad=15, fontweight='bold',
-                          color=c_text)
+    ax_d_common.set_title('Распределение влияния удаления нейронов', fontsize=17, pad=15, fontweight='bold', color=c_text)
     ax_d_common.set_xlabel('Падение точности предсказания (z-значения)', fontsize=15, labelpad=25, color=c_text)
 
-    # Увеличенный коэффициент (fontsize=16)
     ax_d_common.text(0.95, 0.95, f"$\\mu_3 = {stats['Delta']['skew']:.2f}$",
                      transform=ax_d_common.transAxes, ha='right', va='top',
-                     fontsize=16, color=c_text, bbox=dict(facecolor='white', alpha=0.9, edgecolor='none'))
+                     fontsize=30, color=c_text, bbox=dict(facecolor='white', alpha=0.9, edgecolor='none'))
 
     save_path = output_path / 'heavy_tail_smooth_zscore.png'
     plt.savefig(save_path, dpi=1000, bbox_inches='tight', facecolor='white')
@@ -3686,7 +3784,7 @@ def plot_r2_and_network_size_dependencies(unified_csv='stat_tables/unified_model
              fontsize=15, color=c_text, weight='bold',
              bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', pad=5), zorder=5)
 
-    ax2.set_xlabel('Доля активных нейронов (%)', fontsize=13, labelpad=10, color=c_text)
+    ax2.set_xlabel('Доля участвующих нейронов (%)', fontsize=13, labelpad=10, color=c_text)
     ax2.set_ylabel('$R^2$', fontsize=14, labelpad=10, color=c_text)
     # ax2.set_title("Качество vs Разреженность ансамбля", fontsize=15, pad=15, fontweight='bold', color=c_text)
 
@@ -3707,7 +3805,7 @@ def plot_r2_and_network_size_dependencies(unified_csv='stat_tables/unified_model
              bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', pad=5), zorder=5)
 
     ax3.set_xlabel('Общее количество нейронов', fontsize=13, labelpad=10, color=c_text)
-    ax3.set_ylabel('Количество активных нейронов', fontsize=14, labelpad=10, color=c_text)
+    ax3.set_ylabel('Количество участвующих нейронов', fontsize=14, labelpad=10, color=c_text)
     # ax3.set_title("Масштабирование ансамбля", fontsize=15, pad=15, fontweight='bold', color=c_text)
 
     # ------------------------------------------
@@ -4594,17 +4692,17 @@ def plot_weight_survival_dependency(
 def plot_combined_longitudinal_survival(
         match_dir='MatchData',
         models_dir='models_LNOF_Lasso',
-        database_csv='LNOF_SynchronizedData/LNOF_database.csv',
+        ablation_csv='stat_tables/full_ablation_stats.csv',
         top_csv='stat_tables/top_neurons_ablation_3.0sigma.csv',
         output_dir='plots',
         model_is_zero_indexed=True):
     """
     Отслеживает выживаемость сразу 4-х ансамблей (от Дня 1):
     - Все нейроны (Черный)
-    - Информативные / Клетки места (Синий)
-    - Важные / Lasso (Маджента)
-    - Сильные / >3sigma (Alpine Green)
-    Без индивидуальных траекторий, с умным разнесением подписей (радиальное).
+    - Важные (z-delta > 0) (Синий)
+    - Участвующие (веса > 0) (Маджента)
+    - Сильные (>3sigma) (Alpine Green)
+    Убраны цифры с правого графика (процентов), легенда лаконичная.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -4613,7 +4711,7 @@ def plot_combined_longitudinal_survival(
     match_files = list(Path(match_dir).glob("LNOF_*.csv"))
 
     try:
-        df_db = pd.read_csv(database_csv)
+        df_abl = pd.read_csv(ablation_csv)
         df_top = pd.read_csv(top_csv)
         df_names = df_top[df_top['data_type'] == 'Neuron Names'].copy()
         top_cols = [c for c in df_names.columns if c.startswith('top_')]
@@ -4624,7 +4722,7 @@ def plot_combined_longitudinal_survival(
     results = []
 
     print(f"\n{'=' * 75}")
-    print("Расчет комбинированной выживаемости (Все + Информативные + Важные + Сильные)")
+    print("Расчет комбинированной выживаемости (Все + Важные + Участвующие + Сильные)")
     print(f"{'=' * 75}")
 
     for file_path in match_files:
@@ -4636,7 +4734,7 @@ def plot_combined_longitudinal_survival(
         if df_map.shape[1] < 4:
             continue
 
-        sets_all, sets_int, sets_lin, sets_top = [], [], [], []
+        sets_all, sets_val, sets_lin, sets_top = [], [], [], []
         valid_chain = True
 
         for day_idx in range(4):
@@ -4648,27 +4746,49 @@ def plot_combined_longitudinal_survival(
             tracked_mask = col_data.notna() & (col_data > 0)
             sets_all.append(set(df_map[tracked_mask].index))
 
-            # 2. ИНФОРМАТИВНЫЕ (Клетки места)
-            df_int = df_db[(df_db['mouse'] == mouse) & (df_db['session'] == day) & (df_db['feature'] == 'place')]
-            int_ids = [int(idx) + (1 if model_is_zero_indexed else 0) for idx in df_int[df_int['me'] > 0]['neuron_idx']]
-            sets_int.append(set(df_map[col_data.isin(int_ids)].index))
-
-            # 3. ВАЖНЫЕ (Lasso)
+            # Загрузка модели для Важных и Участвующих
             model_path = Path(models_dir) / f"{model_session}.pkl"
-            if not model_path.exists(): valid_chain = False; break
+            if not model_path.exists():
+                valid_chain = False
+                break
+
             data = joblib.load(model_path)
             model = data.get('model')
-            if not hasattr(model, 'coef_'): valid_chain = False; break
+            if not hasattr(model, 'coef_'):
+                valid_chain = False
+                break
 
             coefs = np.array(model.coef_)
             weights = np.linalg.norm(coefs, axis=0) if coefs.ndim > 1 else np.abs(coefs)
             feat_names = np.array(data.get('feature_names'))
 
+            # 2. УЧАСТВУЮЩИЕ (Веса Lasso > 0)
             lin_ids = []
             for name in feat_names[weights > 0]:
                 match = re.search(r'\d+', str(name))
-                if match: lin_ids.append(int(match.group()) + (1 if model_is_zero_indexed else 0))
+                if match:
+                    lin_ids.append(int(match.group()) + (1 if model_is_zero_indexed else 0))
             sets_lin.append(set(df_map[col_data.isin(lin_ids)].index))
+
+            # 3. ВАЖНЫЕ (z-crit > 0)
+            val_ids = []
+            abl_rows = df_abl[df_abl['model_session'] == model_session]
+            if not abl_rows.empty:
+                abl_row = abl_rows.iloc[0]
+                base_r2 = abl_row['baseline_r2']
+                abl_r2_vals = np.array([abl_row.get(f'ablation_{f}', np.nan) for f in feat_names])
+
+                crit = base_r2 - abl_r2_vals
+                valid_crit = crit[~np.isnan(crit)]
+
+                if len(valid_crit) > 0 and np.std(valid_crit) > 0:
+                    zcrit = (crit - np.mean(valid_crit)) / np.std(valid_crit)
+                    for name in feat_names[~np.isnan(zcrit) & (zcrit > 0)]:
+                        match = re.search(r'\d+', str(name))
+                        if match:
+                            val_ids.append(int(match.group()) + (1 if model_is_zero_indexed else 0))
+
+            sets_val.append(set(df_map[col_data.isin(val_ids)].index))
 
             # 4. СИЛЬНЫЕ (>3sigma)
             row = df_names[(df_names['mouse'] == mouse) & (df_names['session'] == day)]
@@ -4676,14 +4796,15 @@ def plot_combined_longitudinal_survival(
             if not row.empty:
                 for name in row.iloc[0][top_cols].dropna().values:
                     match = re.search(r'\d+', str(name))
-                    if match: top_ids.append(int(match.group()) + (1 if model_is_zero_indexed else 0))
+                    if match:
+                        top_ids.append(int(match.group()) + (1 if model_is_zero_indexed else 0))
             sets_top.append(set(df_map[col_data.isin(top_ids)].index))
 
         if not valid_chain or len(sets_all[0]) == 0:
             continue
 
         # Сохраняем пулы Дня 1
-        b_all, b_int = len(sets_all[0]), len(sets_int[0])
+        b_all, b_val = len(sets_all[0]), len(sets_val[0])
         b_lin, b_top = len(sets_lin[0]), len(sets_top[0])
 
         for step in range(4):
@@ -4691,15 +4812,15 @@ def plot_combined_longitudinal_survival(
 
             # Кумулятивное пересечение (Выжившие с 1-го дня)
             s_all = len(set.intersection(*sets_all[:step + 1]))
-            s_int = len(set.intersection(*sets_int[:step + 1]))
+            s_val = len(set.intersection(*sets_val[:step + 1]))
             s_lin = len(set.intersection(*sets_lin[:step + 1]))
             s_top = len(set.intersection(*sets_top[:step + 1]))
 
             results.append({
                 'mouse': mouse, 'day': day_num,
-                'abs_all': s_all, 'abs_int': s_int, 'abs_lin': s_lin, 'abs_top': s_top,
+                'abs_all': s_all, 'abs_val': s_val, 'abs_lin': s_lin, 'abs_top': s_top,
                 'frac_all': (s_all / b_all * 100) if b_all > 0 else 0,
-                'frac_int': (s_int / b_int * 100) if b_int > 0 else 0,
+                'frac_val': (s_val / b_val * 100) if b_val > 0 else 0,
                 'frac_lin': (s_lin / b_lin * 100) if b_lin > 0 else 0,
                 'frac_top': (s_top / b_top * 100) if b_top > 0 else 0
             })
@@ -4721,17 +4842,16 @@ def plot_combined_longitudinal_survival(
     c_text = '#2C3E50'
     colors = {
         'all': 'black',
-        'int': '#3498DB',  # Синий (Информативные)
-        'lin': '#D81B60',  # Маджента (Важные)
+        'val': '#3498DB',  # Синий (Важные)
+        'lin': '#D81B60',  # Маджента (Участвующие)
         'top': '#12A57A'  # Alpine Green (Сильные)
     }
 
-    markers = {'all': 'o', 'int': 's', 'lin': 'D', 'top': '^'}
+    markers = {'all': 'o', 'val': 's', 'lin': 'D', 'top': '^'}
 
-    # Агрегация средних для аннотаций (ИСПРАВЛЕНИЕ: numeric_only=True)
     agg = df_res.groupby('day').mean(numeric_only=True).reset_index()
 
-    # --- Отрисовка линий (Только агрегированные, без индивидуальных) ---
+    # --- Отрисовка линий ---
     for ax, prefix in zip([ax1, ax2], ['abs_', 'frac_']):
         for key in colors.keys():
             sns.lineplot(
@@ -4740,18 +4860,10 @@ def plot_combined_longitudinal_survival(
                 markeredgecolor='none', err_kws={'facecolor': colors[key], 'alpha': 0.15, 'linewidth': 0}, zorder=4
             )
 
-    # --- Умный радиальный алгоритм для подписей 4-х точек ---
-    def annotate_4_points(ax, day, values_dict, max_y, is_percent=False):
-        if is_percent and day == 1:
-            # Для 1-го дня процентов все равны 100%, ставим одну подпись
-            ax.annotate("100%", (day, 100), textcoords="offset points", xytext=(0, 15),
-                        ha='center', va='bottom', fontsize=11, color='black', weight='bold', zorder=6)
-            return
-
-        # Сортируем по значению Y
+    # --- Умный радиальный алгоритм для подписей (ТОЛЬКО для левого графика) ---
+    def annotate_4_points(ax, day, values_dict, max_y):
         sorted_items = sorted(values_dict.items(), key=lambda x: x[1][0], reverse=True)
 
-        # Радиальные позиции: 1 - Верх, 2 - Низ, 3 - Лево, 4 - Право
         placements = [
             (0, 14, 'bottom', 'center'),
             (0, -16, 'top', 'center'),
@@ -4765,13 +4877,13 @@ def plot_combined_longitudinal_survival(
             if va == 'top' and y_val < max_y * 0.05:
                 oy = -5  # Защита от наезда на нижнюю ось
 
-            txt = f"{y_val:.1f}" + ("%" if is_percent else "")
+            txt = f"{y_val:.1f}"
             ax.annotate(txt, (day, y_val), textcoords="offset points", xytext=(ox, oy),
                         ha=ha, va=va, fontsize=10, color=color, weight='bold', zorder=6)
 
-    # Применяем аннотации
-    max_abs = agg[['abs_all', 'abs_int', 'abs_lin', 'abs_top']].max().max() * 1.2
-    max_frac = 115  # Для процентов жесткий лимит
+    # Применяем аннотации только к левому (абсолютному) графику
+    max_abs = agg[['abs_all', 'abs_val', 'abs_lin', 'abs_top']].max().max() * 1.2
+    max_frac = 115
 
     ax1.set_ylim(-0.5, max_abs)
     ax2.set_ylim(-2, max_frac)
@@ -4779,26 +4891,20 @@ def plot_combined_longitudinal_survival(
     for _, row in agg.iterrows():
         d = row['day']
 
-        # Абсолютные
+        # Подписи только для абсолютных количеств
         dict_abs = {
-            'all': (row['abs_all'], colors['all']), 'int': (row['abs_int'], colors['int']),
+            'all': (row['abs_all'], colors['all']), 'val': (row['abs_val'], colors['val']),
             'lin': (row['abs_lin'], colors['lin']), 'top': (row['abs_top'], colors['top'])
         }
-        annotate_4_points(ax1, d, dict_abs, max_abs, is_percent=False)
-
-        # Проценты
-        dict_frac = {
-            'all': (row['frac_all'], colors['all']), 'int': (row['frac_int'], colors['int']),
-            'lin': (row['frac_lin'], colors['lin']), 'top': (row['frac_top'], colors['top'])
-        }
-        annotate_4_points(ax2, d, dict_frac, max_frac, is_percent=True)
+        annotate_4_points(ax1, d, dict_abs, max_abs)
+        # Для ax2 (проценты) функцию annotate_4_points больше не вызываем!
 
     # --- Оформление ---
     ax1.set_title("Выживаемость ансамблей (Сырые количества)", fontsize=15, pad=15, fontweight='bold', color=c_text)
     ax2.set_title("Доля сохраненных нейронов от Дня 1", fontsize=15, pad=15, fontweight='bold', color=c_text)
 
     ax1.set_ylabel("Количество нейронов (шт.)", fontsize=14, labelpad=10, color=c_text)
-    ax2.set_ylabel("Выживаемость (%)", fontsize=14, labelpad=10, color=c_text)
+    ax2.set_ylabel("Доля нейронов соответствующих дню 1", fontsize=14, labelpad=10, color=c_text)
 
     for ax in axes:
         ax.set_facecolor('white')
@@ -4815,18 +4921,18 @@ def plot_combined_longitudinal_survival(
         ax.tick_params(axis='both', which='major', labelsize=11, width=1.2, colors=c_text)
         ax.grid(axis='both', linestyle=':', alpha=0.4, color='#BDC3C7', zorder=0)
 
-    # Кастомная легенда (размещаем на правом графике)
+    # Кастомная, лаконичная легенда на правом графике
     legend_elements = [
         mlines.Line2D([], [], color=colors['all'], marker=markers['all'], markersize=8, markeredgecolor='none', lw=2.5,
                       label='Все активные нейроны'),
-        mlines.Line2D([], [], color=colors['int'], marker=markers['int'], markersize=8, markeredgecolor='none', lw=2.5,
-                      label='Информативные (Клетки места)'),
         mlines.Line2D([], [], color=colors['lin'], marker=markers['lin'], markersize=8, markeredgecolor='none', lw=2.5,
-                      label='Участвующие (Веса Lasso $\\neq$ 0)'),
+                      label='Участвующие'),
+        mlines.Line2D([], [], color=colors['val'], marker=markers['val'], markersize=8, markeredgecolor='none', lw=2.5,
+                      label='Важные'),
         mlines.Line2D([], [], color=colors['top'], marker=markers['top'], markersize=9, markeredgecolor='none', lw=2.5,
                       label='Сильные (>3$\\sigma$)')
     ]
-    ax2.legend(handles=legend_elements, loc='best', frameon=False, fontsize=11, labelcolor=c_text)
+    ax2.legend(handles=legend_elements, loc='best', frameon=False, fontsize=14, labelcolor=c_text)
 
     plt.tight_layout(w_pad=4.0)
 
@@ -5037,20 +5143,1472 @@ def plot_combined_r2_left_panels_with_baseline(
     print(f"\n✓ Успех! Комбинированный график с пунктирным бейзлайном сохранен: {save_path}")
 
 
+def plot_combined_r2_single_panel_with_baseline(
+        top_metrics_csv='stat_tables/top_vs_rest_metrics_abl.csv',
+        unified_csv='stat_tables/unified_model_performance_report.csv',
+        models_dir='models_LNOF_Lasso',
+        data_dir='LNOF_SynchronizedData',
+        output_dir='plots',
+        test_size=0.25):
+    """
+    Объединяет графики сравнения R2 на одной панели.
+    Шрифты увеличены в 3 раза, оси строго черные.
+    Случайный бейзлайн подписан в легенде.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # 1. Загрузка таблиц
+    try:
+        df_top = pd.read_csv(top_metrics_csv)
+        df_uni = pd.read_csv(unified_csv)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Не найден один из файлов: {e}")
+        return
+
+    # Объединение
+    df = df_top[['model_name', 'top_count', 'top_r2', 'rest_r2']].merge(
+        df_uni[['model_name', 'r2', 'total_neurons']], on='model_name', how='inner'
+    )
+    df_clean = df.dropna(subset=['top_count', 'top_r2', 'rest_r2', 'r2', 'total_neurons'])
+
+    if df_clean.empty:
+        print("[ERROR] Недостаточно валидных данных для построения графиков.")
+        return
+
+    print(f"\n{'=' * 75}")
+    print("Генерация случайного бейзлайна (10 итераций на сессию)...")
+    print(f"{'=' * 75}")
+
+    random_baselines = []
+
+    # 2. Расчет случайного бейзлайна "на лету"
+    for idx, row in df_clean.iterrows():
+        model_name = row['model_name']
+        top_count = int(row['top_count'])
+
+        if top_count <= 0:
+            continue
+
+        model_path = Path(models_dir) / f"{model_name}.pkl"
+        data_file = Path(data_dir) / f"LNOF_{model_name}_aligned.npz"
+
+        if not model_path.exists() or not data_file.exists():
+            continue
+
+        # Загрузка модели
+        m_data = joblib.load(model_path)
+        model = m_data.get('model')
+        scaler = m_data.get('scaler')
+
+        if not hasattr(model, 'coef_'):
+            continue
+
+        coefs = np.array(model.coef_)
+        weights = np.linalg.norm(coefs, axis=0) if coefs.ndim > 1 else np.abs(coefs)
+        important_idx = np.where(weights > 0)[0]
+
+        if len(important_idx) == 0:
+            continue
+
+        # Загрузка данных
+        features_raw, labels_raw = load_data(data_file)
+        split_idx = int(len(features_raw) * (1 - test_size))
+
+        if isinstance(features_raw, pd.DataFrame):
+            X_test_raw = features_raw.iloc[split_idx:].values
+            y_test = labels_raw.iloc[split_idx:].values
+        else:
+            X_test_raw = features_raw[split_idx:]
+            y_test = labels_raw[split_idx:]
+
+        X_test = scaler.transform(X_test_raw) if scaler is not None else X_test_raw
+
+        # 10 случайных итераций
+        for _ in range(10):
+            sample_size = min(top_count, len(important_idx))
+            rand_idx = np.random.choice(important_idx, size=sample_size, replace=False)
+
+            X_rand = np.zeros_like(X_test)
+            X_rand[:, rand_idx] = X_test[:, rand_idx]
+
+            y_pred = model.predict(X_rand)
+            r2_rand = r2_score(y_test, y_pred)
+
+            random_baselines.append({
+                'top_count': top_count,
+                'r2_rand': r2_rand
+            })
+
+    df_rand = pd.DataFrame(random_baselines)
+    print(f"Сгенерировано {len(df_rand)} точек случайного бейзлайна.")
+
+    # ==========================================
+    # ЭСТЕТИЧЕСКАЯ ОТРИСОВКА (ГИГАНТСКИЙ МАСШТАБ)
+    # ==========================================
+    # Увеличиваем полотно, чтобы текст 45pt не слипался
+    fig, ax = plt.subplots(figsize=(24, 16))
+    fig.patch.set_facecolor('white')
+
+    c_text = 'black'  # Строгий черный вместо '#2C3E50'
+    c_blue = '#64B5F6'
+    c_yellow = '#FBC02D'
+    c_green = '#43A047'
+    c_rand = 'grey'
+
+    # 1. Бейзлайн (регрессия тонким пунктиром + точки, на заднем фоне)
+    sns.regplot(data=df_rand, x='top_count', y='r2_rand', ax=ax, color=c_rand,
+                scatter_kws={'alpha': 0.25, 's': 40, 'edgecolors': 'none', 'zorder': 1},
+                line_kws={'linestyle': ':', 'linewidth': 3, 'alpha': 0.6, 'zorder': 1},
+                label='Случайный бейзлайн')
+
+    # 4. Сильные нейроны
+    sns.regplot(data=df_clean, x='top_count', y='top_r2', ax=ax, color=c_yellow,
+                scatter_kws={'alpha': 0.8, 's': 200, 'edgecolors': 'none', 'zorder': 4},
+                line_kws={'linestyle': '--', 'linewidth': 6, 'alpha': 0.9, 'zorder': 2},
+                label='Сильные нейроны (>3$\sigma$)')
+
+    # 3. Остальные важные нейроны
+    sns.regplot(data=df_clean, x='top_count', y='rest_r2', ax=ax, color=c_green,
+                scatter_kws={'alpha': 0.7, 's': 200, 'edgecolors': 'none', 'zorder': 3},
+                line_kws={'linestyle': '--', 'linewidth': 6, 'alpha': 0.9, 'zorder': 2},
+                label='Остальные уч. нейроны')
+
+    # 2. Полноценная модель
+    sns.regplot(data=df_clean, x='top_count', y='r2', ax=ax, color=c_blue,
+                scatter_kws={'alpha': 0.7, 's': 200, 'edgecolors': 'none', 'zorder': 3},
+                line_kws={'linestyle': '--', 'linewidth': 6, 'alpha': 0.9, 'zorder': 2},
+                label='Все нейроны')
+
+    # ==========================================
+    # ОБЩЕЕ ФОРМАТИРОВАНИЕ ОПТИКИ
+    # ==========================================
+    for collection in ax.collections:
+        if type(collection).__name__ == 'PolyCollection':
+            collection.set_alpha(0.20)
+            collection.set_zorder(0)
+
+    # Увеличенные в 3 раза подписи осей (было 13 и 15 -> стало 39 и 45)
+    ax.set_xlabel('Количество сильных нейронов (>3$\sigma$)', fontsize=39, labelpad=20, color=c_text)
+    ax.set_ylabel(r'$R^2$', fontsize=45, labelpad=20, color=c_text)
+
+    # Лимиты X
+    ax.set_xlim(left=0)
+
+    # Очистка рамок и настройка утолщенных осей (под стать гигантскому тексту)
+    ax.set_facecolor('white')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(3.5)
+    ax.spines['bottom'].set_linewidth(3.5)
+    [s.set_color(c_text) for s in ax.spines.values()]
+
+    # Увеличенные в 3 раза тики (было 12 -> стало 36)
+    ax.tick_params(axis='both', which='major', labelsize=36, width=3.5, length=12, colors=c_text)
+    ax.grid(axis='both', linestyle=':', alpha=0.4, color='black', zorder=0)
+
+    # Обработка легенды (Оставляем бейзлайн)
+    handles, labels = ax.get_legend_handles_labels()
+    # Фильтруем только технические метки, оставляем наш подписанный бейзлайн
+    valid_indices = [i for i, l in enumerate(labels) if l not in ['r2_rand', 'top_count', '']]
+    handles_filtered = [handles[i] for i in valid_indices]
+    labels_filtered = [labels[i] for i in valid_indices]
+
+    # Увеличенная легенда (было 11 -> стало 33)
+    ax.legend(handles_filtered[::-1], labels_filtered[::-1], fontsize=33, loc='lower right', frameon=False,
+              labelcolor=c_text)
+
+    plt.tight_layout(pad=3.0)
+
+    # Сохранение
+    save_path = output_path / 'r2_topology_single_panel_giant_text.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white') # Снизил DPI до 300, так как холст 24x16 дюймов
+    plt.close()
+
+    print(f"\n✓ Успех! Объединенный график (Масштаб х3, Черные оси) сохранен: {save_path}")
+
+
+def plot_comparability_threshold_dependency(
+        metrics_csv='stat_tables/top_vs_rest_metrics_abl.csv',
+        r2_threshold=0.15,
+        output_dir='plots'):
+    """
+    Строит два графика:
+    1. Локальная вероятность сопоставимости (как распределена по бинам).
+    2. Накопительная вероятность (для всех сессий >= X сильных нейронов) + Индекс Джини.
+    Размер точек пропорционален количеству сессий.
+    """
+    path_csv = Path(metrics_csv)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    if not path_csv.exists():
+        print(f"[ERROR] Файл не найден: {path_csv}")
+        return
+
+    df = pd.read_csv(path_csv)
+    req_cols = ['top_count', 'top_r2', 'rest_r2']
+    if not all(c in df.columns for c in req_cols):
+        print(f"[ERROR] В таблице отсутствуют нужные колонки: {req_cols}")
+        return
+
+    df_clean = df.dropna(subset=req_cols).copy()
+    if df_clean.empty:
+        print("[ERROR] Нет данных после очистки NaN.")
+        return
+
+    # --- 1. Подготовка данных ---
+    df_clean['r2_diff'] = (df_clean['top_r2'] - df_clean['rest_r2']).abs()
+    df_clean['is_comparable'] = (df_clean['r2_diff'] <= r2_threshold).astype(int)
+
+    # ДАННЫЕ ЛЕВОГО ГРАФИКА: Локальные бины (ровно X нейронов)
+    agg_df = df_clean.groupby('top_count').agg(
+        success_rate=('is_comparable', lambda x: x.mean() * 100),
+        session_count=('is_comparable', 'count')
+    ).reset_index()
+
+    # ДАННЫЕ ПРАВОГО ГРАФИКА: Накопительные (>= X нейронов)
+    thresholds = sorted(df_clean['top_count'].unique())
+    cum_success = []
+    cum_counts = []
+
+    for th in thresholds:
+        # Берем все сессии, где сильных нейронов >= текущего порога
+        subset = df_clean[df_clean['top_count'] >= th]
+        rate = subset['is_comparable'].mean() * 100
+
+        cum_success.append(rate)
+        cum_counts.append(len(subset))
+
+    cum_df = pd.DataFrame({
+        'threshold': thresholds,
+        'cum_success_rate': cum_success,
+        'remaining_sessions': cum_counts
+    })
+
+    # --- 2. Расчет статистик ---
+    # Спирмен (Левый график)
+    corr, pval = spearmanr(agg_df['top_count'], agg_df['success_rate'])
+
+    # Индекс Джини (Правый график)
+    def gini_coefficient(x):
+        """Классический расчет коэффициента Джини для массива значений"""
+        x = np.array(x, dtype=np.float64)
+        if np.amin(x) < 0:
+            x -= np.amin(x)  # Сдвиг на случай отрицательных значений
+        x += 1e-10  # Защита от деления на ноль
+        x = np.sort(x)
+        n = len(x)
+        return (np.sum((2 * np.arange(1, n + 1) - n - 1) * x)) / (n * np.sum(x))
+
+    gini_val = gini_coefficient(cum_df['cum_success_rate'])
+
+    def get_stars(p):
+        return r"^{\ast\ast\ast}" if p < 0.001 else r"^{\ast\ast}" if p < 0.01 else r"^{\ast}" if p < 0.05 else "^{ns}"
+
+    # =========================================================================
+    # ЭСТЕТИЧЕСКАЯ ОТРИСОВКА
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.patch.set_facecolor('white')
+    ax1, ax2 = axes
+
+    c_text = '#2C3E50'
+    c_dots = '#3498DB'  # Синий (Левый)
+    c_line = '#E74C3C'  # Красный тренд (Левый)
+    c_cum = '#8E44AD'  # Глубокий пурпурный (Правый накопительный)
+
+    # --------------------------------------------------
+    # ЛЕВЫЙ ГРАФИК: Локальная вероятность
+    # --------------------------------------------------
+    scatter = ax1.scatter(agg_df['top_count'], agg_df['success_rate'],
+                          s=agg_df['session_count'] * 40,
+                          color=c_dots, alpha=0.75, edgecolors='white', linewidth=1.5, zorder=3)
+
+    sns.regplot(data=agg_df, x='top_count', y='success_rate', ax=ax1,
+                scatter=False, color=c_line,
+                line_kws={'linestyle': '--', 'linewidth': 2.5, 'zorder': 2},
+                ci=95, scatter_kws={'alpha': 0.2})
+
+    stars = get_stars(pval)
+    stat_text_left = f"$\\rho = {corr:.2f}{stars}$"
+    ax1.text(0.05, 0.95, stat_text_left, transform=ax1.transAxes, ha='left', va='top',
+             fontsize=15, color=c_text, weight='bold',
+             bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', pad=5), zorder=5)
+
+    ax1.set_title(rf"Локальная вероятность ($\Delta R^2 \leq {r2_threshold}$)",
+                  fontsize=15, pad=15, fontweight='bold', color=c_text)
+    ax1.set_xlabel(r"Количество сильных нейронов (>3$\sigma$)", fontsize=13, labelpad=10, color=c_text)
+    ax1.set_ylabel("Доля сопоставимых сессий (%)", fontsize=13, labelpad=10, color=c_text)
+
+    # Легенда размеров (Левый)
+    handles, labels = scatter.legend_elements(prop="sizes", alpha=0.6, num=4, func=lambda s: s / 40)
+    labels = [str(int(round(float(re.findall(r"[-+]?(?:\d*\.*\d+)", l)[0])))) for l in labels]
+    legend = ax1.legend(handles, labels, title="Кол-во\nсессий", loc="lower right",
+                        frameon=False, fontsize=11, title_fontsize=12, labelcolor=c_text)
+    legend.get_title().set_fontweight('bold')
+
+    # --------------------------------------------------
+    # ПРАВЫЙ ГРАФИК: Накопительная вероятность (>= X)
+    # --------------------------------------------------
+    # Размер точек пропорционален оставшимся сессиям (коэффициент меньше, т.к. сессий больше)
+    scatter_cum = ax2.scatter(cum_df['threshold'], cum_df['cum_success_rate'],
+                              s=cum_df['remaining_sessions'] * 15,
+                              color=c_cum, alpha=0.8, edgecolors='white', linewidth=1.5, zorder=3)
+
+    ax2.plot(cum_df['threshold'], cum_df['cum_success_rate'],
+             color=c_cum, linestyle='-', linewidth=2.5, alpha=0.5, zorder=2)
+
+    # Аннотация Джини
+    stat_text_right = f"Gini = {gini_val:.3f}"
+    ax2.text(0.05, 0.95, stat_text_right, transform=ax2.transAxes, ha='left', va='top',
+             fontsize=15, color=c_text, weight='bold',
+             bbox=dict(facecolor='white', alpha=0.9, edgecolor='none', pad=5), zorder=5)
+
+    ax2.set_title(r"Накопительная вероятность (для сессий $\geq X$ нейронов)",
+                  fontsize=15, pad=15, fontweight='bold', color=c_text)
+    ax2.set_xlabel(r"Порог количества сильных нейронов ($X$)", fontsize=13, labelpad=10, color=c_text)
+    ax2.set_ylabel("Доля сопоставимых сессий (%)", fontsize=13, labelpad=10, color=c_text)
+
+    # Легенда размеров (Правый)
+    handles_c, labels_c = scatter_cum.legend_elements(prop="sizes", alpha=0.6, num=4, func=lambda s: s / 15)
+    labels_c = [str(int(round(float(re.findall(r"[-+]?(?:\d*\.*\d+)", l)[0])))) for l in labels_c]
+    legend_c = ax2.legend(handles_c, labels_c, title="Осталось\nсессий", loc="lower right",
+                          frameon=False, fontsize=11, title_fontsize=12, labelcolor=c_text)
+    legend_c.get_title().set_fontweight('bold')
+
+    # --------------------------------------------------
+    # ОБЩЕЕ ФОРМАТИРОВАНИЕ ОПТИКИ
+    # --------------------------------------------------
+    for ax in [ax1, ax2]:
+        ax.set_ylim(-5, 110)
+        ax.set_xlim(left=0)
+        ax.set_facecolor('white')
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.5)
+        ax.spines['bottom'].set_linewidth(1.5)
+        [s.set_color(c_text) for s in ax.spines.values()]
+
+        ax.tick_params(axis='both', which='major', labelsize=12, width=1.5, colors=c_text)
+        ax.grid(axis='both', linestyle=':', alpha=0.4, color='#BDC3C7', zorder=0)
+
+        for collection in ax.collections:
+            if type(collection).__name__ == 'PolyCollection':
+                collection.set_alpha(0.15)
+
+    plt.tight_layout(w_pad=4.0)
+
+    save_path = output_path / 'comparability_probability_with_cumulative.png'
+    plt.savefig(save_path, dpi=1000, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"\n✓ Успешно! Двойной график сохранен: {save_path}")
+    print(f"  > Спирмен (Левый): ρ = {corr:.3f} (p-value: {pval:.2e})")
+    print(f"  > Индекс Джини (Правый): {gini_val:.3f}")
+
+
+def plot_global_euler_diagram_present(sessions=None,
+                              sets_to_plot=('intense', 'linreg', 'zcrit'),
+                              color_scheme='cmyk',
+                              ablation_csv='stat_tables/full_ablation_stats.csv',
+                              database_csv='LNOF_SynchronizedData/LNOF_database.csv',
+                              models_dir='models_LNOF_Lasso',
+                              output_dir='plots'):
+    """
+    Визуализирует пересечение глобальных пулов нейронов.
+    Дизайн: прозрачные круги, только толстые цветные контуры.
+    Числа убраны, подписи размещены СНАРУЖИ кругов черным цветом.
+    Включена строгая фильтрация для MI > 0.04.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    excluded_mice = ['J20', 'J21']
+
+    try:
+        df_abl = pd.read_csv(ablation_csv)
+        df_db = pd.read_csv(database_csv)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Не найден файл базы данных: {e}")
+        return
+
+    all_sessions = df_abl['model_session'].unique().tolist()
+    if sessions is None:
+        sessions_to_process = all_sessions
+    else:
+        sessions_to_process = [s for s in sessions if s in all_sessions]
+
+    sessions_to_process = [s for s in sessions_to_process if s[:3] not in excluded_mice]
+
+    print(f"\n{'=' * 70}")
+    print(f"Сборка глобального графа пересечений (Сессий: {len(sessions_to_process)})")
+    print(f"Фильтрация: MI > 0.04")
+    print(f"{'=' * 70}")
+
+    global_sets = {
+        'intense': set(),
+        'linreg': set(),
+        'zcrit': set(),
+        'crit': set()
+    }
+
+    # Ищем правильное название колонки MI
+    mi_col = 'me' if 'me' in df_db.columns else None
+    if not mi_col:
+        print("[WARNING] Колонка 'MI' не найдена в базе данных. Фильтрация по порогу пропущена.")
+
+    # 1. Итерация по сессиям
+    for sess in sessions_to_process:
+        mouse = sess[:3]
+        day = sess[4:6]
+
+        # --- INTENSE (С фильтром MI > 0.04) ---
+        if 'intense' in sets_to_plot:
+            if mi_col:
+                df_int = df_db[(df_db['mouse'] == mouse) &
+                               (df_db['session'] == day) &
+                               (df_db['feature'] == 'place') &
+                               (df_db[mi_col] > 0.04)]
+            else:
+                df_int = df_db[(df_db['mouse'] == mouse) &
+                               (df_db['session'] == day) &
+                               (df_db['feature'] == 'place')]
+
+            for idx in df_int['neuron_idx'].unique():
+                global_sets['intense'].add(f"{sess}_neuron_{int(idx)}")
+
+        # --- LINREG, CRIT & ZCRIT ---
+        model_path = Path(models_dir) / f"{sess}.pkl"
+        if not model_path.exists():
+            continue
+
+        data = joblib.load(model_path)
+        model = data.get('model')
+        if not hasattr(model, 'coef_'):
+            continue
+
+        feats = np.array(data.get('feature_names'))
+        weights = np.linalg.norm(model.coef_, axis=0) if model.coef_.ndim > 1 else np.abs(model.coef_)
+
+        # LINREG
+        if 'linreg' in sets_to_plot:
+            for f in feats[weights > 0]:
+                global_sets['linreg'].add(f"{sess}_{f}")
+
+        # CRIT & ZCRIT
+        if 'crit' in sets_to_plot or 'zcrit' in sets_to_plot:
+            abl_row = df_abl[df_abl['model_session'] == sess].iloc[0]
+            base_r2 = abl_row['baseline_r2']
+            abl_r2_vals = np.array([abl_row.get(f'ablation_{f}', np.nan) for f in feats])
+
+            crit = base_r2 - abl_r2_vals
+            valid_crit = crit[~np.isnan(crit)]
+
+            if 'crit' in sets_to_plot:
+                for f in feats[~np.isnan(crit) & (crit > 0)]:
+                    global_sets['crit'].add(f"{sess}_{f}")
+
+            if 'zcrit' in sets_to_plot:
+                if len(valid_crit) > 0:
+                    std_c = np.std(valid_crit)
+                    mean_c = np.mean(valid_crit)
+                    if std_c > 0:
+                        zcrit = (crit - mean_c) / std_c
+                        for f in feats[~np.isnan(zcrit) & (zcrit > 0)]:
+                            global_sets['zcrit'].add(f"{sess}_{f}")
+
+    # 2. Подготовка данных
+    subsets = [global_sets[k] for k in sets_to_plot if k in global_sets]
+
+    label_map = {
+        'intense': 'Клетки места',
+        'linreg': 'Участвующие',
+        'zcrit': 'Важные',
+        'crit': r'$\delta$'
+    }
+    labels = [label_map.get(k, k.upper()) for k in sets_to_plot if k in global_sets]
+
+    if len(subsets) < 2:
+        print("[ERROR] Недостаточно множеств для пересечения (минимум 2).")
+        return
+
+    # 3. Визуализация
+    fig, ax = plt.subplots(figsize=(14, 14))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+
+    c_purple = '#8E44AD' # 0000FF
+    c_green = '#27AE60' # 00FF00
+
+    color_maps = {
+        'cmyk': {'100': '#00FFFF', '010': '#FF00FF', '001': '#FFFF00'},
+        'rgb': {'100': '#1F77B4', '010': '#8E44AD', '001': '#27AE60'},
+        'bi': {'100': '#D60270', '010': '#9B4F96', '001': '#0038A8'}
+    }
+
+    scheme = color_scheme.lower()
+    selected_map = color_maps.get(scheme, color_maps['cmyk'])
+
+    # Инициализация графа и извлечение кругов контура
+    if len(subsets) == 3:
+        v = venn3(subsets, set_labels=labels, ax=ax)
+        c = venn3_circles(subsets, ax=ax)
+        colors_for_circles = [selected_map['100'], selected_map['010'], selected_map['001']]
+    else:
+        v = venn2(subsets, set_labels=labels, ax=ax)
+        c = venn2_circles(subsets, ax=ax)
+        colors_for_circles = [selected_map['100'], selected_map['010']]
+
+    if v:
+        # УБИРАЕМ ЗАЛИВКУ
+        for patch in v.patches:
+            if patch:
+                patch.set_facecolor('none')
+                patch.set_edgecolor('none')
+                patch.set_alpha(0)
+
+        # СКРЫВАЕМ ВНУТРЕННИЕ ЧИСЛА
+        for text in v.subset_labels:
+            if text:
+                text.set_visible(False)
+
+        # НАСТРАИВАЕМ ВНЕШНИЕ ПОДПИСИ (Черный цвет, крупный шрифт)
+        for text in v.set_labels:
+            if text:
+                text.set_color('black')
+                text.set_fontsize(36)
+                text.set_fontweight('bold')
+
+        # РИСУЕМ ТОЛСТЫЕ КОНТУРЫ КРУГОВ
+        for i in range(len(subsets)):
+            if c and c[i]:
+                c[i].set_facecolor('none')
+                c[i].set_edgecolor(colors_for_circles[i])
+                c[i].set_linewidth(8)  # Толстый контур
+                c[i].set_alpha(1.0)
+
+    ax.axis('off')
+
+    file_prefix = f"global_euler_outlines_{'_'.join(sets_to_plot)}_{scheme}"
+
+    fig.savefig(output_path / f"{file_prefix}.svg", format='svg', bbox_inches='tight', facecolor='white')
+    fig.savefig(output_path / f"{file_prefix}.png", format='png', dpi=1000, bbox_inches='tight', facecolor='white')
+
+    plt.close()
+    print(f"✓ Диаграмма {scheme.upper()} (контуры + внешние подписи) сохранена в {output_path}")
+
+
+def plot_cumulative_retrain_addition_dual(
+        session_name,
+        data_dir='LNOF_SynchronizedData',
+        models_dir='models_LNOF_Lasso',
+        output_dir='plots',
+        step_size=5,
+        r2_threshold_diff=0.03,
+        med_threshold_diff=0.32
+):
+    """
+    Строит графики переобучения (добавление нейронов) для R2 и MED.
+    Ось X переведена в процент от числа УЧАСТВУЮЩИХ нейронов.
+    Оси имеют стандартный лейаут, но границы X расширены (-3 до 103),
+    чтобы график не пересекался с осью Y.
+    Цвета: Зеленый (Сверху) и Желтый (Снизу).
+    """
+    c_param = 0.5
+    test_size = 0.25
+    max_iter = 100
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    mouse = session_name[:3]
+    day = session_name[4:5]
+
+    # 1. Загрузка базовой модели
+    model_path = Path(models_dir) / f"{session_name}.pkl"
+    if not model_path.exists():
+        print(f"[ERROR] Базовая модель {session_name} не найдена.")
+        return
+
+    data = joblib.load(model_path)
+    base_coef = data.get('model').coef_
+    all_features = np.array(data.get('feature_names'))
+    all_feat_list = list(all_features)
+    num_tot = len(all_features)
+
+    # 2. Изоляция только УЧАСТВУЮЩИХ нейронов (вес > 0)
+    weights = np.linalg.norm(base_coef, axis=0) if base_coef.ndim > 1 else np.abs(base_coef)
+    important_mask = weights >= 0
+    num_part = np.sum(important_mask)
+
+    if num_part == 0:
+        print(f"[ERROR] В модели {session_name} нет участвующих нейронов.")
+        return
+
+    part_features = all_features[important_mask]
+    part_weights = weights[important_mask]
+
+    sorted_idx_desc = np.argsort(part_weights)[::-1]
+    sorted_idx_asc = np.argsort(part_weights)
+
+    np.random.seed(42)
+    rand_idx = np.random.permutation(num_part)
+
+    feat_desc = part_features[sorted_idx_desc]  # Сверху (Сильные)
+    feat_asc = part_features[sorted_idx_asc]  # Снизу (Слабые)
+    feat_rand = part_features[rand_idx]  # Случайно
+
+    # 3. Загрузка данных
+    data_file = Path(data_dir) / f"LNOF_{session_name}_aligned.npz"
+    if not data_file.exists():
+        print(f"[ERROR] Файл данных {data_file} не найден.")
+        return
+
+    features_raw, labels = load_data(data_file)
+    X_train_full, X_test_full, y_train, y_test = train_test_split_temporal(features_raw, labels, test_size=test_size)
+
+    def evaluate_subset(features_subset):
+        if len(features_subset) == 0:
+            return 0.0, np.nan
+
+        if isinstance(X_train_full, pd.DataFrame):
+            X_tr = X_train_full[features_subset]
+            X_te = X_test_full[features_subset]
+        else:
+            idx = [all_feat_list.index(f) for f in features_subset]
+            X_tr = X_train_full[:, idx]
+            X_te = X_test_full[:, idx]
+
+        clf, imp, scl, metrics = train_lasso(X_tr, y_train, X_te, y_test, C=c_param, max_iter=max_iter)
+
+        r2 = metrics.get('test_r2', 0.0)
+        med = metrics.get('test_dist', metrics.get('test_med', metrics.get('test_mae', np.nan)))
+        return r2, med
+
+    # Получаем абсолютный бейзлайн (полная модель)
+    base_r2, base_med = evaluate_subset(all_features)
+
+    # 4. Формируем шаги (только до num_part) и переводим их в проценты
+    steps = list(range(0, num_part, step_size))
+    if steps[-1] != num_part:
+        steps.append(num_part)
+
+    steps_pct = [(k / num_part) * 100 for k in steps]
+
+    print(f"\n{'=' * 70}")
+    print(f"[{session_name}] Начат процесс переобучения (Addition). R2 и MED.")
+    print(f"{'=' * 70}")
+
+    r2_green, med_green = [], []
+    r2_yellow, med_yellow = [], []
+    r2_grey, med_grey = [], []
+
+    # 5. Цикл переобучения
+    for k in steps:
+        r2_g, med_g = evaluate_subset(feat_desc[:k])
+        r2_green.append(r2_g)
+        med_green.append(med_g)
+
+        r2_y, med_y = evaluate_subset(feat_asc[:k])
+        r2_yellow.append(r2_y)
+        med_yellow.append(med_y)
+
+        r2_gr, med_gr = evaluate_subset(feat_rand[:k])
+        r2_grey.append(r2_gr)
+        med_grey.append(med_gr)
+
+        if k % (step_size * 5) == 0 and k > 0:
+            print(f"  > Пройдено {k}/{num_part} нейронов ({(k / num_part) * 100:.1f}%)...")
+
+    # --- Поиск пороговых значений в процентах ---
+    thresh_r2_idx = next((i for i, v in enumerate(r2_green) if v >= base_r2 - r2_threshold_diff), None)
+    thresh_r2_x = steps_pct[thresh_r2_idx] if thresh_r2_idx is not None else None
+
+    thresh_med_idx = next(
+        (i for i, v in enumerate(med_green) if not np.isnan(v) and v <= base_med + med_threshold_diff), None)
+    thresh_med_x = steps_pct[thresh_med_idx] if thresh_med_idx is not None else None
+
+    # --- ВЫВОД РЕЗУЛЬТАТОВ ДЛЯ ТЕКУЩЕЙ СЕССИИ ---
+    print(f"\n{'=' * 70}")
+    print(f"СВОДКА ДЛЯ СЕССИИ: {session_name}")
+    print(f"Всего нейронов: {num_tot} | Участвующих (>0): {num_part}")
+
+    if thresh_r2_x is not None:
+        print(f"\n[R2] Достигнут порог (Δ <= {r2_threshold_diff}): {thresh_r2_x:.1f}% от участвующих")
+    else:
+        print(f"\n[R2] Порог не достигнут даже при использовании всех участвующих нейронов.")
+
+    if thresh_med_x is not None:
+        print(f"[MED] Достигнут порог (Δ <= {med_threshold_diff} см): {thresh_med_x:.1f}% от участвующих")
+    print(f"{'=' * 70}\n")
+
+    # ==========================================
+    # 6. ЭСТЕТИЧЕСКАЯ ОТРИСОВКА
+    # ==========================================
+    c_green = '#FBC02D'  # Сверху
+    c_yellow = '#43A047'  # Снизу
+    c_grey = '#7F8C8D'  # Случайно
+    fill_color = '#BDC3C7'
+    c_text = '#2C3E50'
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.subplots_adjust(top=0.90, bottom=0.25, wspace=0.15)
+    ax1, ax2 = axes
+
+    pt_distance = 432 / len(steps_pct)
+    marker_style = 'o' if pt_distance > 10 else None
+    marker_size = 4
+
+    # --- ПАНЕЛЬ 1: R2 ---
+    ax1.fill_between(steps_pct, r2_green, r2_yellow, color=fill_color, alpha=0.35, edgecolor='none', zorder=1)
+
+    ax1.plot(steps_pct, r2_grey, color=c_grey, lw=2, linestyle='--', alpha=0.6, zorder=2)
+    ax1.plot(steps_pct, r2_yellow, color=c_yellow, lw=2.5, marker=marker_style, markersize=marker_size, zorder=3)
+    ax1.plot(steps_pct, r2_green, color=c_green, lw=2.5, marker=marker_style, markersize=marker_size, zorder=4)
+
+    if thresh_r2_x is not None:
+        ax1.axvline(x=thresh_r2_x, color='black', linestyle='-.', alpha=0.4, linewidth=1.5, zorder=1)
+
+    ax1.set_ylabel(r"$R^2$", fontsize=15, labelpad=10, color=c_text)
+    ax1.yaxis.set_major_locator(MultipleLocator(0.1))
+
+    # --- ПАНЕЛЬ 2: MED ---
+    ax2.fill_between(steps_pct, med_green, med_yellow, color=fill_color, alpha=0.35, edgecolor='none', zorder=1)
+
+    ax2.plot(steps_pct, med_grey, color=c_grey, lw=2, linestyle='--', alpha=0.6, zorder=2)
+    ax2.plot(steps_pct, med_yellow, color=c_yellow, lw=2.5, marker=marker_style, markersize=marker_size, zorder=3)
+    ax2.plot(steps_pct, med_green, color=c_green, lw=2.5, marker=marker_style, markersize=marker_size, zorder=4)
+
+    if thresh_med_x is not None:
+        ax2.axvline(x=thresh_med_x, color='black', linestyle='-.', alpha=0.4, linewidth=1.5, zorder=1)
+
+    ax2.set_ylabel("MED (см)", fontsize=13, labelpad=10, color=c_text)
+    ax2.yaxis.set_major_locator(MultipleLocator(1.0))
+
+    # --- ОЧИСТКА И ФОРМАТИРОВАНИЕ ОСЕЙ ---
+    for ax in axes:
+        ax.grid(axis='y', linestyle='--', alpha=0.5, color='#BDC3C7', zorder=0)
+        ax.grid(axis='x', linestyle=':', alpha=0.3, color='#BDC3C7', zorder=0)
+
+        # Расширяем границы, чтобы данные не касались осей Y, но сохраняем стандартный лейаут
+        ax.set_xlim(-3, 103)
+        # Фиксируем тики на ровных значениях
+        ax.set_xticks(np.arange(0, 101, 20))
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.spines['left'].set_color(c_text)
+        ax.spines['bottom'].set_linewidth(1.2)
+        ax.spines['bottom'].set_color(c_text)
+
+        ax.tick_params(axis='both', which='major', labelsize=11, width=1.2, colors=c_text)
+
+    # ЕДИНАЯ ПОДПИСЬ ДЛЯ ОСИ X
+    fig.supxlabel("Доля добавленных нейронов (%)", fontsize=14, color=c_text, y=0.15)
+
+    # --- ЛЕГЕНДА СНИЗУ ---
+    legend_elements = [
+        mlines.Line2D([0], [0], color=c_green, lw=2.5, marker='o', markersize=5, label='Сверху'),
+        mlines.Line2D([0], [0], color=c_grey, lw=2, linestyle='--', alpha=0.6, label='Случайно'),
+        mlines.Line2D([0], [0], color=c_yellow, lw=2.5, marker='o', markersize=5, label='Снизу')
+    ]
+
+    fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0.10),
+               ncol=3, frameon=False, fontsize=12, handlelength=2.5, columnspacing=2.0)
+
+    mouse_formatted = mouse.replace('J', '') if mouse.startswith('J') else mouse
+    fig.suptitle(f"Мышь J{mouse_formatted} день {day}", fontsize=18, fontweight='bold', y=0.98, color=c_text)
+
+    # 7. Сохранение
+    save_path = output_path / f'cumulative_addition_dual_{session_name}.png'
+    plt.savefig(save_path, dpi=1000, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"\n✓ Готово! Двойной график Addition (R2 + MED) сохранен: {save_path}")
+
+
+def plot_top_neurons_survival_absolute_with_baseline_present(
+        top_csv='stat_tables/top_neurons_ablation_3.0sigma.csv',
+        match_dir='MatchData',
+        models_dir='models_LNOF_Lasso',
+        output_dir='plots',
+        model_is_zero_indexed=True):
+    """
+    Отслеживает абсолютное количество топовых нейронов (>3 sigma) по дням.
+    Отрисовывает 1 график (сохраняя пропорции).
+    Индивидуальные траектории скрыты для минимализма.
+    Добавлен серый пунктирный бейзлайн случайного физического выживания ВАЖНЫХ нейронов.
+    Легенда размещена в безопасной зоне по оси Y (между 0.5 и 4).
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    excluded_mice = ['J20', 'J21']
+    match_files = list(Path(match_dir).glob("LNOF_*.csv"))
+
+    try:
+        df_top = pd.read_csv(top_csv)
+    except FileNotFoundError:
+        print(f"[ERROR] Не найден файл: {top_csv}")
+        return
+
+    df_names = df_top[df_top['data_type'] == 'Neuron Names'].copy()
+    top_cols = [c for c in df_names.columns if c.startswith('top_')]
+
+    results = []
+    rand_results = []
+
+    print(f"\n{'=' * 75}")
+    print("Расчет выживаемости (Абсолютные количества + Случайный бейзлайн важных x10)")
+    print(f"{'=' * 75}")
+
+    for file_path in match_files:
+        mouse = file_path.stem.replace('LNOF_', '')
+        if mouse in excluded_mice:
+            continue
+
+        df_map = pd.read_csv(file_path, header=None)
+        if df_map.shape[1] < 4:
+            continue
+
+        tracked_sets = []
+        important_sets = []
+
+        for day_idx in range(4):
+            day = f"{day_idx + 1}D"
+
+            col_data = df_map[day_idx]
+            tracked_mask = col_data.notna() & (col_data > 0)
+            tracked_sets.append(set(df_map[tracked_mask].index))
+
+            row = df_names[(df_names['mouse'] == mouse) & (df_names['session'] == day)]
+            important_local_ids = []
+
+            if not row.empty:
+                neuron_names = row.iloc[0][top_cols].dropna().values
+                for name in neuron_names:
+                    match = re.search(r'\d+', str(name))
+                    if match:
+                        n_id = int(match.group())
+                        if model_is_zero_indexed:
+                            n_id += 1
+                        important_local_ids.append(n_id)
+
+            important_mask = col_data.isin(important_local_ids)
+            important_sets.append(set(df_map[important_mask].index))
+
+        if len(important_sets[0]) == 0:
+            continue
+
+        # --- 1. Извлекаем пул ВАЖНЫХ нейронов из модели 1-го дня ---
+        model_path = Path(models_dir) / f"{mouse}_1D.pkl"
+        day1_important_pool = []
+
+        if model_path.exists():
+            m_data = joblib.load(model_path)
+            model = m_data.get('model')
+            if hasattr(model, 'coef_'):
+                coefs = np.array(model.coef_)
+                weights = np.linalg.norm(coefs, axis=0) if coefs.ndim > 1 else np.abs(coefs)
+                feat_names = np.array(m_data.get('feature_names'))
+
+                for name in feat_names[weights > 0]:
+                    match = re.search(r'\d+', str(name))
+                    if match:
+                        n_id = int(match.group())
+                        if model_is_zero_indexed:
+                            n_id += 1
+                        day1_important_pool.append(n_id)
+
+        # Убеждаемся, что эти важные нейроны реально затрекались в 1-й день
+        day1_important_pool = list(set(day1_important_pool).intersection(tracked_sets[0]))
+        num_strong_day1 = len(important_sets[0])
+
+        # --- 2. Расчет случайного бейзлайна (10 итераций из ВАЖНЫХ) ---
+        for _ in range(10):
+            # Защита: берем не больше, чем есть в пуле важных
+            sample_size = min(num_strong_day1, len(day1_important_pool))
+
+            if sample_size > 0:
+                rand_day1 = set(np.random.choice(day1_important_pool, size=sample_size, replace=False))
+            else:
+                rand_day1 = set()
+
+            for step in range(4):
+                # Смотрим, сколько из этих случайных физически отследились в день D
+                rand_survived = len(rand_day1.intersection(*tracked_sets[:step + 1]))
+                rand_results.append({
+                    'mouse': mouse,
+                    'day': step + 1,
+                    'rand_survived': rand_survived
+                })
+
+        # --- 3. Расчет целевых метрик ---
+        for step in range(4):
+            day_num = step + 1
+            N_top_d = len(important_sets[step])
+            V_d = len(set.intersection(*important_sets[:step + 1]))
+
+            results.append({
+                'mouse': mouse,
+                'day': day_num,
+                'N_top_d': N_top_d,
+                'V_d': V_d
+            })
+
+        print(f"[{mouse}] Обработано. Сильных в 1D: {num_strong_day1}")
+
+    df_res = pd.DataFrame(results)
+    df_rand = pd.DataFrame(rand_results)
+
+    if df_res.empty:
+        print("[ERROR] Нет данных для построения.")
+        return
+
+    # =========================================================================
+    # ЭСТЕТИЧЕСКАЯ ОТРИСОВКА (Alpine Green Theme, 1 график)
+    # =========================================================================
+    fig, ax = plt.subplots(figsize=(7, 6))  # Сохраняем соотношение сторон одной панели
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+
+    c_text = '#2C3E50'
+    c_agg_base = 'black'
+    c_line_imp = '#12A57A'  # Alpine Green
+    c_rand = 'grey'
+
+    # 1. Глобальные тренды
+    # Черная линия
+    sns.lineplot(data=df_res, x='day', y='N_top_d', ax=ax, color=c_agg_base,
+                 errorbar=('ci', 95), marker='o', markersize=8, linewidth=2.5,
+                 markeredgecolor='none', err_kws={'facecolor': 'grey', 'alpha': 0.20, 'linewidth': 0}, zorder=5)
+
+    # Серая пунктирная линия (Случайные ВАЖНЫЕ)
+    sns.lineplot(data=df_rand, x='day', y='rand_survived', ax=ax, color=c_rand,
+                 errorbar=('ci', 95), linestyle='--', marker='s', markersize=6, linewidth=1.5,
+                 markeredgecolor='none', err_kws={'facecolor': c_rand, 'alpha': 0.15, 'linewidth': 0}, zorder=3)
+
+    # Alpine Green линия
+    sns.lineplot(data=df_res, x='day', y='V_d', ax=ax, color=c_line_imp,
+                 errorbar=('ci', 95), marker='^', markersize=10, linewidth=2.5,
+                 markerfacecolor=c_line_imp, markeredgecolor='none',
+                 err_kws={'facecolor': c_line_imp, 'alpha': 0.25, 'linewidth': 0}, zorder=6)
+
+    # 2. Умные аннотации
+    agg_res = df_res.groupby('day').mean(numeric_only=True).reset_index()
+    agg_rand = df_rand.groupby('day').mean(numeric_only=True).reset_index()
+
+    global_max = max(agg_res['N_top_d'].max(), agg_res['V_d'].max(), agg_rand['rand_survived'].max()) * 1.25
+    ax.set_ylim(-0.5, global_max)
+
+    for d in range(1, 5):
+        y_b = agg_res.loc[agg_res['day'] == d, 'N_top_d'].values[0]
+        y_v = agg_res.loc[agg_res['day'] == d, 'V_d'].values[0]
+        y_r = agg_rand.loc[agg_rand['day'] == d, 'rand_survived'].values[0]
+
+        if d == 1:
+            ax.annotate(f"{y_v:.1f}", (d, y_v), textcoords="offset points", xytext=(0, 12),
+                        ha='center', va='bottom', fontsize=11, color=c_agg_base, weight='bold', zorder=7)
+        else:
+            points = [(y_b, c_agg_base), (y_r, c_rand), (y_v, c_line_imp)]
+            points.sort(key=lambda x: x[0])
+
+            for i, (y_val, color) in enumerate(points):
+                if i == 0:
+                    off, va = -14, 'top'
+                elif i == len(points) - 1:
+                    off, va = 12, 'bottom'
+                else:
+                    dist_up = points[i + 1][0] - y_val
+                    dist_down = y_val - points[i - 1][0]
+                    if dist_up > dist_down:
+                        off, va = 12, 'bottom'
+                    else:
+                        off, va = -14, 'top'
+
+                if va == 'top' and y_val < global_max * 0.05:
+                    off, va = 12, 'bottom'
+
+                ax.annotate(f"{y_val:.1f}", (d, y_val), textcoords="offset points", xytext=(0, off),
+                            ha='center', va=va, fontsize=11, color=color, weight='bold', zorder=7)
+
+    # 3. Оформление осей и рамки
+    ax.set_title("Абсолютный дрейф", fontsize=14, pad=15, fontweight='bold', color=c_text)
+    ax.set_ylabel("Количество сильных нейронов", fontsize=13, labelpad=10, color=c_text)
+    ax.set_xlabel("День", fontsize=13, labelpad=10, color=c_text)
+
+    ax.set_xticks([1, 2, 3, 4])
+    ax.set_xlim(0.8, 4.2)
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(1.2)
+    ax.spines['bottom'].set_linewidth(1.2)
+    [s.set_color(c_text) for s in ax.spines.values()]
+
+    ax.tick_params(axis='both', which='major', labelsize=11, width=1.2, colors=c_text)
+    ax.grid(axis='both', linestyle=':', alpha=0.4, color='#BDC3C7', zorder=0)
+
+    # 4. Легенда (Размещена на пустом месте между 4 и 0.5 по Y)
+    legend_elements = [
+        mlines.Line2D([], [], color=c_agg_base, marker='o', markersize=8, markeredgecolor='none', lw=2.5,
+                      label='Все нейроны'),
+        mlines.Line2D([], [], color=c_rand, marker='s', markersize=6, linestyle='--', markeredgecolor='none', lw=1.5,
+                      label='Случайные участвующие'),
+        mlines.Line2D([], [], color=c_line_imp, marker='^', markerfacecolor=c_line_imp, markeredgecolor='none',
+                      markersize=10, lw=2.5, label='Соответствующие 1 дню')
+    ]
+
+    # bbox_to_anchor привязывает легенду к координатам осей (x=0.98, y=0.35)
+    # Это позиционирует её справа, но приподнимает над самыми нижними точками 4-го дня
+    ax.legend(handles=legend_elements, bbox_to_anchor=(0.96, 0.25), loc='center right',
+              frameon=False, fontsize=11, labelcolor=c_text)
+
+    plt.tight_layout()
+
+    save_path = output_path / 'longitudinal_top_neurons_absolute_with_baseline_clean.png'
+    plt.savefig(save_path, dpi=1000, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"✓ График абсолютного дрейфа сохранен: {save_path}")
+
+
+def plot_ablation_broken_axis_smart_text(model_sessions, sigma_threshold=3,
+                                         csv_path='stat_tables/full_ablation_stats.csv',
+                                         output_dir='plots'):
+    """
+    Строит график дисперсии R2 при лезировании нейронов (Broken Axis).
+    Все элементы (шрифты, точки, линии) увеличены примерно в 3 раза.
+    Квадратный лейаут для одной сессии. R2 вынесено за пределы,
+    а на верхней оси оставлены только значения исходных моделей.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"[ERROR] Файл не найден: {csv_path}")
+        return
+
+    df = df[df['model_session'].isin(model_sessions)].copy()
+    if df.empty:
+        print("[WARNING] Данные для указанных моделей не найдены.")
+        return
+
+    x_order = df['model_session'].unique().tolist()
+    model_to_x = {model: i for i, model in enumerate(x_order)}
+
+    # Преобразование данных
+    id_vars = ['model_session', 'baseline_r2', 'mean_r2', 'std_r2']
+    abl_cols = [col for col in df.columns if col.startswith('ablation_neuron_')]
+
+    df_long = pd.melt(df, id_vars=id_vars, value_vars=abl_cols, var_name='neuron_col', value_name='r2')
+    df_long = df_long.dropna(subset=['r2']).copy()
+
+    df_long['neuron_id'] = df_long['neuron_col'].apply(
+        lambda x: re.search(r'\d+', x).group() if re.search(r'\d+', x) else x
+    )
+
+    df_base = df[['model_session', 'baseline_r2']].drop_duplicates()
+
+    base_min, base_max = df_base['baseline_r2'].min(), df_base['baseline_r2'].max()
+    abl_min, abl_max = df_long['r2'].min(), df_long['r2'].max()
+
+    gap_exists = (base_min - abl_max) > 0.01
+
+    # --- НАСТРОЙКА КВАДРАТНОГО ЛЕЙАУТА И УВЕЛИЧЕННЫХ РАЗМЕРОВ ---
+    # Для 1 сессии будет квадрат 12x12
+    fig_width = 12 if len(x_order) == 1 else max(12, len(x_order) * 8)
+    fig_height = 12
+
+    c_text = '#2C3E50'
+
+    if gap_exists:
+        fig, (ax_top, ax_bottom) = plt.subplots(
+            2, 1, sharex=True,
+            figsize=(fig_width, fig_height),
+            gridspec_kw={'height_ratios': [1, 4]}
+        )
+        fig.subplots_adjust(hspace=0.05)
+        axes = [ax_top, ax_bottom]
+
+        ax_top.spines['bottom'].set_visible(False)
+        ax_bottom.spines['top'].set_visible(False)
+        ax_top.tick_params(labeltop=False, bottom=False)
+        ax_bottom.xaxis.tick_bottom()
+    else:
+        fig, ax_bottom = plt.subplots(figsize=(fig_width, fig_height))
+        axes = [ax_bottom]
+        ax_top = ax_bottom
+
+    np.random.seed(42)
+    texts_to_adjust = []
+    x_outliers = []  # НОВОЕ
+    y_outliers = []  # НОВОЕ
+
+    for model in x_order:
+        subset = df_long[df_long['model_session'] == model].copy()
+        x_base = model_to_x[model]
+
+        # Растягиваем точки шире
+        jitters = np.random.uniform(-0.45, 0.45, size=len(subset))
+        subset['x_jit'] = x_base + jitters
+
+        # Увеличенные черные точки (s=150 вместо 20)
+        ax_bottom.scatter(subset['x_jit'], subset['r2'], color='black', alpha=0.5, s=600, edgecolors='none', zorder=3)
+
+        # Увеличенная красная точка (s=600 вместо 90)
+        base_val = df_base[df_base['model_session'] == model]['baseline_r2'].values[0]
+        ax_top.scatter(x_base, base_val, color='#D62728', s=1000, edgecolors='none', zorder=10)
+
+        mean_r2 = subset['mean_r2'].iloc[0]
+        std_r2 = subset['std_r2'].iloc[0]
+        threshold = mean_r2 - (sigma_threshold * std_r2)
+
+        outliers = subset[subset['r2'] < threshold]
+
+        for _, row in outliers.iterrows():
+            x_outliers.append(row['x_jit'])  # НОВОЕ
+            y_outliers.append(row['r2'])  # НОВОЕ
+
+            # ОГРОМНЫЙ ШРИФТ ДЛЯ ВЫБРОСОВ (fontsize=36)
+            txt = ax_bottom.text(
+                row['x_jit'], row['r2'],
+                f" {row['neuron_id']} ",
+                fontsize=36,
+                fontweight='bold',
+                color=c_text,
+                ha='center', va='center',
+                zorder=5
+            )
+            texts_to_adjust.append(txt)
+
+    if gap_exists:
+        margin_base = (base_max - base_min) * 0.5 if base_max != base_min else 0.02
+        margin_abl = (abl_max - abl_min) * 0.1
+
+        ax_top.set_ylim(base_min - margin_base, base_max + margin_base)
+        ax_bottom.set_ylim(abl_min - margin_abl, abl_max + margin_abl)
+
+        # ТОЛЬКО значения исходной модели на верхней оси
+        base_vals = df_base['baseline_r2'].unique()
+        ax_top.set_yticks(base_vals)
+
+        # Увеличенные засечки разрыва (lw=3.0)
+        d = .015
+        kwargs = dict(transform=ax_top.transAxes, color=c_text, clip_on=False, lw=3.0)
+        ax_top.plot((-d, +d), (-d, +d), **kwargs)
+        ax_top.plot((1 - d, 1 + d), (-d, +d), **kwargs)
+        kwargs.update(transform=ax_bottom.transAxes)
+        ax_bottom.plot((-d, +d), (1 - d, 1 + d), **kwargs)
+        ax_bottom.plot((1 - d, 1 + d), (1 - d, 1 + d), **kwargs)
+
+    # Разводка текста
+    if adjust_text and texts_to_adjust:
+        adjust_text(
+            texts_to_adjust,
+            x=x_outliers,
+            y=y_outliers,
+            ax=ax_bottom,
+            expand_points=(1.8, 1.8),  # Создает невидимый радиус вокруг точки
+            expand_text=(1.2, 1.2),  # Буфер между самими подписями
+            force_points=(1.5, 1.5),  # Сила отталкивания текста от точек
+            force_text=(1.0, 1.0),  # Сила отталкивания текста от текста
+            arrowprops=dict(
+                arrowstyle="-",
+                color='gray',
+                lw=2.0,
+                alpha=0.6,
+                shrinkA=15,  # Отступ стрелки от центра гигантской точки
+                shrinkB=5  # Отступ стрелки от текста
+            )
+        )
+
+    # --- ОФОРМЛЕНИЕ МИНИМАЛИЗМА (Толстые линии и гигантские шрифты) ---
+    try:
+        formatted_labels = [format_session_label(m) for m in x_order]
+    except NameError:
+        formatted_labels = x_order
+
+    ax_bottom.set_xticks(range(len(x_order)))
+    ax_bottom.set_xticklabels(formatted_labels, rotation=0, ha='center', fontsize=36, color=c_text)
+
+    for ax in axes:
+        ax.grid(axis='y', linestyle=':', alpha=0.4, color='#BDC3C7', zorder=0, linewidth=2.0)
+        ax.tick_params(axis='y', labelsize=28, colors=c_text, width=3.0, length=8)
+        ax.tick_params(axis='x', width=3.0, length=8)
+        ax.spines['left'].set_linewidth(3.0)
+        ax.spines['right'].set_visible(False)
+        if ax == ax_top:
+            ax.spines['top'].set_visible(False)
+        if ax == ax_bottom:
+            ax.spines['bottom'].set_linewidth(3.0)
+        [s.set_color(c_text) for s in ax.spines.values()]
+
+    # --- ПОДПИСЬ Y (ВЫНЕСЕНА ДАЛЕКО ВЛЕВО И УВЕЛИЧЕНА) ---
+    fig.supylabel(r'$R^2$', fontsize=48, x=-0.05, color=c_text, fontweight='bold')
+
+    # --- КАСТОМНАЯ ЛЕГЕНДА (Увеличенная) ---
+    legend_elements = [
+        mlines.Line2D([0], [0], marker='o', color='w', markerfacecolor='#D62728', markersize=24,
+                      label='Исходная модель'),
+        mlines.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', alpha=0.5, markersize=18,
+                      label='Удален один нейрон'),
+        mlines.Line2D([0], [0], marker='$\mathbb{N}$', color='w', markerfacecolor=c_text, markeredgecolor=c_text,
+                      markersize=26,
+                      label=f'Отклонение > {sigma_threshold}$\\sigma$')
+    ]
+
+    ax_top.legend(handles=legend_elements, loc='lower right', frameon=False, fontsize=24, labelcolor=c_text)
+
+    plt.subplots_adjust(left=0.15, right=0.95, bottom=0.1)
+
+    safe_names = [re.sub(r'\W+', '', m) for m in model_sessions[:3]]
+    prefix = "_".join(safe_names)
+    if len(model_sessions) > 3:
+        prefix += "_and_others"
+
+    save_path = output_path / f'ablation_{prefix}_sigma{sigma_threshold}_HUGE.png'
+
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"✓ Масштабированный квадратный график успешно сохранен: {save_path}")
+
+
+def plot_delta_vs_mi_dependencies_dual(ablation_csv='stat_tables/full_ablation_stats.csv',
+                                       database_csv='LNOF_SynchronizedData/LNOF_database.csv',
+                                       models_dir='models_LNOF_Lasso',
+                                       output_dir='plots'):
+    """
+    Строит два графика в логарифмических координатах (log2):
+    1. (Слева) Зависимость веса (beta) от MI. Тау Кендалла. Фиолетовый.
+    2. (Справа) Зависимость важности (z-delta) от MI. Спирмен. Зеленый.
+
+    Дизайн для презентаций: Огромные шрифты, уменьшенные точки, строгие греческие символы,
+    вертикальный порог MI=0.04, полностью унифицированная размерная сетка осей.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        df_abl = pd.read_csv(ablation_csv)
+        df_db = pd.read_csv(database_csv)
+    except FileNotFoundError as e:
+        print(f"[ERROR] Не найден файл: {e}")
+        return
+
+    print(f"\n{'=' * 70}")
+    print("Сборка пула нейронов для графиков \u03B2 и \u03B4 от MI (log2 шкала)...")
+
+    mi_all, zcrit_all, beta_all = [], [], []
+    feat_cols = [col for col in df_abl.columns if col.startswith('ablation_')]
+    feature_names = [col.replace('ablation_', '') for col in feat_cols]
+
+    for _, row in df_abl.iterrows():
+        model_name = row['model_session']
+        mouse, day = model_name[:3], model_name[4:6]
+
+        # 1. Загрузка весов из модели
+        model_path = Path(models_dir) / f"{model_name}.pkl"
+        if not model_path.exists():
+            continue
+
+        m_data = joblib.load(model_path)
+        model = m_data.get('model')
+        if not hasattr(model, 'coef_'):
+            continue
+
+        coefs = np.array(model.coef_)
+        weights = np.linalg.norm(coefs, axis=0) if coefs.ndim > 1 else np.abs(coefs)
+        feat_names_model = np.array(m_data.get('feature_names'))
+        weight_dict = dict(zip(feat_names_model, weights))
+
+        # 2. Вычисление z-delta (z-crit)
+        base_r2 = row['baseline_r2']
+        abl_vals = row[feat_cols].values.astype(float)
+        crit = base_r2 - abl_vals
+
+        valid_crit = crit[~np.isnan(crit)]
+        if len(valid_crit) > 0 and np.std(valid_crit) > 0:
+            zcrit = (crit - np.mean(valid_crit)) / np.std(valid_crit)
+        else:
+            zcrit = np.zeros_like(crit)
+
+        # 3. Извлечение MI (me)
+        df_intense = df_db[(df_db['mouse'] == mouse) & (df_db['session'] == day) & (df_db['feature'] == 'place')].copy()
+        df_intense = df_intense.sort_values(by='me', ascending=False).drop_duplicates(subset=['neuron_idx'])
+        me_dict = {f"neuron_{int(r['neuron_idx'])}": r['me'] for _, r in df_intense.iterrows()}
+
+        # Сопоставление
+        mi = np.array([me_dict.get(f, 0.0) for f in feature_names])
+        betas = np.array([weight_dict.get(f, 0.0) for f in feature_names])
+
+        mi_all.extend(mi)
+        zcrit_all.extend(zcrit)
+        beta_all.extend(betas)
+
+    df_plot = pd.DataFrame({'mi': mi_all, 'zcrit': zcrit_all, 'beta': beta_all}).dropna()
+
+    # Подготовка данных (теперь правый график не обрезается по 0.04)
+    df_left = df_plot[(df_plot['mi'] > 0) & (df_plot['beta'] > 0)].copy()
+    df_right = df_plot[(df_plot['mi'] > 0) & (df_plot['zcrit'] > 0)].copy()
+
+    print(f"Пул для \u03B2 vs MI (Слева): {len(df_left)} нейронов")
+    print(f"Пул для \u03B4 vs MI (Справа): {len(df_right)} нейронов")
+    print(f"{'=' * 70}")
+
+    corr_beta, p_beta = kendalltau(df_left['mi'], df_left['beta'])
+    corr_zcrit, p_zcrit = spearmanr(df_right['mi'], df_right['zcrit'])
+
+    # Математически ровные звездочки
+    def get_stars(p):
+        return r"{\ast}{\ast}{\ast}" if p < 0.001 else r"{\ast}{\ast}" if p < 0.01 else r"{\ast}" if p < 0.05 else "^{ns}"
+
+    # Доверительный интервал в лог-пространстве
+    def calc_trend_ci(x, y):
+        log2_x = np.log2(x)
+        log2_y = np.log2(y)
+        m, b = np.polyfit(log2_x, log2_y, 1)
+
+        x_trend_log = np.linspace(log2_x.min(), log2_x.max(), 100)
+        y_trend_log = m * x_trend_log + b
+
+        n = len(log2_x)
+        y_hat = m * log2_x + b
+        s_err = np.sqrt(np.sum((log2_y - y_hat) ** 2) / (n - 2))
+        t_val = t.ppf(0.975, n - 2)
+        mean_x = np.mean(log2_x)
+        ssx = np.sum((log2_x - mean_x) ** 2)
+
+        ci = t_val * s_err * np.sqrt(1 / n + (x_trend_log - mean_x) ** 2 / ssx)
+
+        return 2 ** x_trend_log, 2 ** y_trend_log, 2 ** (y_trend_log - ci), 2 ** (y_trend_log + ci)
+
+    # ==========================================
+    # ЭСТЕТИЧЕСКАЯ ОТРИСОВКА (ПРЕЗЕНТАЦИЯ)
+    # ==========================================
+    fig, axes = plt.subplots(1, 2, figsize=(24, 11))
+    fig.patch.set_facecolor('white')
+    ax1, ax2 = axes
+
+    c_purple = '#8E44AD'
+    c_green = '#27AE60'
+    c_text = '#2C3E50'
+
+    font_label = 42
+    font_tick = 33
+    font_stat = 40
+    lw_axes = 3.6
+    lw_trend = 6.0
+
+    # Уменьшенный размер точек для снижения визуального шума
+    scatter_size = 120
+
+    # --- ЛЕВЫЙ ГРАФИК (ВЕСА vs MI) ---
+    x_tr1, y_tr1, y_low1, y_up1 = calc_trend_ci(df_left['mi'], df_left['beta'])
+
+    ax1.scatter(df_left['mi'], df_left['beta'], alpha=0.5, s=scatter_size, color=c_purple, edgecolors='none', zorder=3)
+    ax1.plot(x_tr1, y_tr1, color='grey', linestyle='--', linewidth=lw_trend, alpha=0.6, zorder=4)
+    ax1.fill_between(x_tr1, y_low1, y_up1, color='grey', alpha=0.35, zorder=2)
+
+    stat_text1 = f"$\\tau = {corr_beta:.2f}^{{{get_stars(p_beta)}}}$"
+    ax1.text(0.05, 0.95, stat_text1, transform=ax1.transAxes, ha='left', va='top',
+             fontsize=font_stat, color=c_text, fontweight='bold',
+             bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', pad=10), zorder=5)
+
+    # --- ПРАВЫЙ ГРАФИК (ВАЖНОСТЬ vs MI) ---
+    x_tr2, y_tr2, y_low2, y_up2 = calc_trend_ci(df_right['mi'], df_right['zcrit'])
+
+    ax2.scatter(df_right['mi'], df_right['zcrit'], alpha=0.5, s=scatter_size, color=c_green, edgecolors='none',
+                zorder=3)
+    ax2.plot(x_tr2, y_tr2, color='grey', linestyle='--', linewidth=lw_trend, alpha=0.6, zorder=4)
+    ax2.fill_between(x_tr2, y_low2, y_up2, color='grey', alpha=0.35, zorder=2)
+
+    stat_text2 = f"$\\rho = {corr_zcrit:.2f}^{{{get_stars(p_zcrit)}}}$"
+    ax2.text(0.05, 0.95, stat_text2, transform=ax2.transAxes, ha='left', va='top',
+             fontsize=font_stat, color=c_text, fontweight='bold',
+             bbox=dict(facecolor='white', alpha=0.85, edgecolor='none', pad=10), zorder=5)
+
+    # --- ОБЩЕЕ ВЫРАВНИВАНИЕ ОСЕЙ И СЕТОК ---
+    # Синхронизируем лимиты осей (чтобы сетки 1 в 1 совпадали по пропорциям)
+    global_x_min = min(df_left['mi'].min(), df_right['mi'].min()) * 0.8
+    global_x_max = max(df_left['mi'].max(), df_right['mi'].max()) * 1.2
+
+    # Y оси у нас имеют разную физическую природу (веса vs z-score),
+    # но мы приведем их к одинаковым лимитам, чтобы шаг сетки был визуально идентичен
+    global_y_min = min(df_left['beta'].min(), df_right['zcrit'].min()) * 0.8
+    global_y_max = max(df_left['beta'].max(), df_right['zcrit'].max()) * 1.2
+
+    for ax, ylabel in zip([ax1, ax2], [r'Вес ($\beta$)', r'Важность ($\delta$)']):
+        ax.set_xscale('log', base=2)
+        ax.set_yscale('log', base=2)
+
+        # Жесткая синхронизация лимитов
+        ax.set_xlim(global_x_min, global_x_max)
+        ax.set_ylim(global_y_min, global_y_max)
+
+        # Жестко задаем 6 делений: 2^-7, 2^-6, 2^-5, 2^-4, 2^-3, 2^-2 (0.25)
+        ax.set_xticks([2 ** i for i in range(-7, -1)])
+
+        # Обновляем лимиты оси X, чтобы график не обрезал крайние точки
+        # ax.set_xlim(2 ** -7, 0.25)
+        ax.yaxis.set_major_locator(LogLocator(base=2))
+
+        def tick_formatter(val, pos):
+            if val < 0.125 or val > 8:
+                return f"$2^{{{int(np.round(np.log2(val)))}}}$"
+            return f"{val:g}"
+
+        custom_formatter = FuncFormatter(tick_formatter)
+        ax.xaxis.set_major_formatter(custom_formatter)
+        ax.yaxis.set_major_formatter(custom_formatter)
+        ax.xaxis.set_minor_formatter(NullFormatter())
+        ax.yaxis.set_minor_formatter(NullFormatter())
+
+        ax.set_xlabel('MI', fontsize=font_label, labelpad=20, color=c_text)
+        ax.set_ylabel(ylabel, fontsize=font_label, labelpad=20, color=c_text)
+
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(lw_axes)
+        ax.spines['bottom'].set_linewidth(lw_axes)
+        [s.set_color(c_text) for s in ax.spines.values()]
+
+        ax.tick_params(axis='both', which='major', labelsize=font_tick, width=lw_axes, length=12, colors=c_text)
+        ax.grid(axis='both', linestyle=':', alpha=0.4, color='#BDC3C7', zorder=0, linewidth=2)
+        ax.set_facecolor('white')
+
+        # Добавляем вертикальный пунктирный порог MI = 0.04
+        ax.axvline(0.04, color='grey', linestyle='--', linewidth=5, alpha=0.6, zorder=1)
+
+    plt.tight_layout(w_pad=6.0)
+
+    save_path = output_path / 'weights_and_zdelta_vs_mi_huge.png'
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"✓ Гигантские графики успешно сохранены: {save_path}")
+
+
 if __name__ == "__main__":
     # plot_metrics_sigma_distribution()
-    # models_dir = "models_LNOF_Lasso"
-    # models_path = Path(models_dir)
-    # models = [f.name[:6] for f in models_path.glob("*.pkl")]
-    # models = ['J24_3D.pkl', 'J54_4D.pkl', 'J18_2D.pkl', 'J59_4D.pkl', 'J52_2D.pkl']
-    # models = [model[:-4] for model in models]
+    models_dir = "models_LNOF_Lasso"
+    models_path = Path(models_dir)
+    models = [f.name[:6] for f in models_path.glob("*.pkl")]
+    models = ['J24_3D.pkl', 'J54_4D.pkl', 'J18_2D.pkl', 'J59_4D.pkl', 'J52_2D.pkl']
+    models = [model[:-4] for model in models]
     # plot_retrain_ablation_distribution(models)
     # plot_selective_neuron_graphs([models[1]], selectivity='linreg', corr_threshold=0.25)
 
     # plot_retrain_ablation_distribution([models[0]])
     # plot_ablation_broken_axis_smart_text(models[:3], sigma_threshold=3)
 
-    plot_global_euler_diagram()
+    # plot_global_euler_diagram(color_scheme='rgb')
     # plot_r2_dependencies()
     # plot_neuron_composition_stacked_barplot(models)
     # plot_delta_vs_mi_dependencies()
@@ -5071,3 +6629,12 @@ if __name__ == "__main__":
     #
     # plot_combined_r2_left_panels_with_baseline()
     # plot_top_neurons_survival_absolute_with_baseline()
+    # plot_comparability_threshold_dependency()
+
+    plot_combined_r2_single_panel_with_baseline()
+    # plot_global_euler_diagram_present(color_scheme='rgb')
+    # plot_cumulative_retrain_addition_dual(models[0], step_size=1)
+    # plot_top_neurons_survival_absolute_with_baseline_present()
+    # plot_ablation_broken_axis_smart_text([models[0]])
+    # plot_delta_vs_mi_dependencies_dual()
+    # plot_combined_longitudinal_survival()
